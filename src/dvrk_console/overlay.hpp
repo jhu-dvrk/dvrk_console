@@ -1,0 +1,147 @@
+#ifndef DVRK_DISPLAY_OVERLAY_HPP
+#define DVRK_DISPLAY_OVERLAY_HPP
+
+#include <gst/gst.h>
+#include <cairo/cairo.h>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <sensor_msgs/msg/joy.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/float64.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+
+#include <unordered_map>
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <string>
+#include <chrono>
+
+namespace sv {
+
+enum class TeleopSide {
+    Left,
+    Right
+};
+
+struct ButtonState {
+    bool present = false;
+    bool active = false;
+    std::chrono::steady_clock::time_point expiration;
+
+    int get_status() const {
+        if (active) return 1;
+        if (std::chrono::steady_clock::now() < expiration) return 2;
+        return 0;
+    }
+
+    bool is_active() const {
+        return get_status() != 0;
+    }
+};
+
+struct TeleopIndicator {
+    TeleopSide side = TeleopSide::Left;
+    std::string arm_name;
+    int psm_number = 0;
+    bool is_camera_teleop = false;
+    bool following_active = false;
+    double scale = 1.0;
+    std::string current_state;
+};
+
+struct ArmOverlayInfo {
+    bool measured_cp_valid = true;
+    std::string tool_type;
+};
+
+struct OverlayState {
+    ButtonState camera;
+    ButtonState clutch;
+    ButtonState operator_present;
+
+    int frame_width = 0;
+    int frame_height = 0;
+    bool overlay_enabled = true;
+    bool show_grid = false;
+    double overlay_alpha = 0.7;
+    int display_horizontal_offset_px = 0;
+    std::unordered_map<std::string, std::pair<int, int>> overlay_frame_size_by_name;
+    double camera_roll = 0.0;
+    std::unordered_map<std::string, TeleopIndicator> teleop_indicators;
+    std::unordered_map<std::string, ArmOverlayInfo> arm_info;
+    std::mutex mutex;
+};
+
+bool parse_teleop_name(
+    const std::string& teleop_name,
+    std::string& mtm_name,
+    TeleopSide& side,
+    int& psm_number,
+    std::string* arm_name = nullptr,
+    bool* is_camera_teleop = nullptr
+);
+
+void on_teleop_selected(
+    const std_msgs::msg::String::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_teleop_unselected(
+    const std_msgs::msg::String::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_teleop_following(
+    const std::string& teleop_name,
+    const std_msgs::msg::Bool::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+void on_teleop_scale(
+    const std::string& teleop_name,
+    const std_msgs::msg::Float64::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+void on_teleop_current_state(
+    const std::string& teleop_name,
+    const std_msgs::msg::String::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_teleop_measured_cp(
+    const std::string& psm_name,
+    const geometry_msgs::msg::PoseStamped::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_teleop_tool_type(
+    const std::string& psm_name,
+    const std_msgs::msg::String::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_camera_joy(
+    const sensor_msgs::msg::Joy::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_clutch_joy(
+    const sensor_msgs::msg::Joy::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_operator_present(
+    const sensor_msgs::msg::Joy::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+void on_ecm_measured_js(
+    const sensor_msgs::msg::JointState::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_overlay_caps_changed(GstElement*, GstCaps* caps, gpointer user_data);
+void on_overlay_draw(GstElement*, cairo_t* cr, guint64, guint64, gpointer user_data);
+
+}  // namespace sv
+
+#endif
