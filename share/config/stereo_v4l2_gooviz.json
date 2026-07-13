@@ -7,9 +7,7 @@
     "glimage"
   ],
   "unixfdsinks": [
-    {
-      "stream": "stereo"
-    }
+    {"socket": "stereo"}
   ],
   "camera": {
     "size": {

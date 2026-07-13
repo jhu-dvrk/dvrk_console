@@ -26,12 +26,11 @@
 #include <filesystem>
 #include <iomanip>
 #include <memory>
-#include <pwd.h>
 #include <sstream>
-#include <unistd.h>
 
 #include <fstream>
 #include <dvrk_data/config.hpp>
+#include <dvrk_data/dvrk_gst_socket.hpp>
 #include <dvrk_data/stereo_common.hpp>
 #include <dvrk_data/window_monitor_manager.hpp>
 
@@ -69,135 +68,37 @@ struct CommandLineOptions {
     std::vector<std::string> video_sources;
 };
 
-const char *get_username() {
-    const char *username = getenv("USER");
-    if (!username) {
-        struct passwd *pw = getpwuid(getuid());
-        username = pw ? pw->pw_name : "unknown";
-    }
-    return username;
+// ── Video source resolution and discovery ─────────────────────────────────────
+
+/// Build a label from an abstract socket name for display in the UI.
+/// "@dvrk_gst:role:name" → "name (role)"
+std::string video_source_label(const std::string &abstract_name) {
+    const auto last_colon = abstract_name.rfind(':');
+    if (last_colon == std::string::npos) return abstract_name;
+    const std::string name = abstract_name.substr(last_colon + 1);
+    const auto mid_colon = abstract_name.rfind(':', last_colon - 1);
+    if (mid_colon == std::string::npos) return name;
+    const std::string role =
+        abstract_name.substr(mid_colon + 1, last_colon - mid_colon - 1);
+    return name + " (" + role + ")";
 }
 
-std::string trim_video_source_prefix(std::string source) {
-    if (!source.empty() && source.front() == ':') {
-        source.erase(source.begin());
-    }
-    return source;
+/// Resolve a user-supplied source string to a fully-qualified abstract name.
+/// Accepts "@dvrk_gst:role:name", "role:name", or "name" (default role: stereo_display).
+std::string resolve_video_source_path(const std::string &source) {
+    return dvrk_gst::resolve(source, dvrk_gst::ROLE_STEREO_DISPLAY);
 }
 
-std::string video_source_label(const std::string& source) {
-    const std::string normalized = trim_video_source_prefix(source);
-    size_t last_slash = normalized.find_last_of('/');
-    return (last_slash == std::string::npos) ? normalized : normalized.substr(last_slash + 1);
-}
-
-std::string resolve_video_source_path(const std::string& viewer_name,
-                                      const std::string& source) {
-    const std::string normalized = trim_video_source_prefix(source);
-    if (normalized.find('/') != std::string::npos ||
-        normalized.find(".sock") != std::string::npos) {
-        return normalized;
-    }
-    return "/tmp/" + viewer_name + "_" + normalized + "_" +
-           std::string(get_username()) + ".sock";
-}
-
-VideoSource make_video_source(const std::string& viewer_name,
-                              const std::string& source) {
-    return VideoSource{video_source_label(source),
-                       resolve_video_source_path(viewer_name, source)};
-}
-
-std::vector<VideoSource> scan_available_video_sources(const std::string& viewer_name) {
+/// Scan /proc/net/unix for active @dvrk_gst abstract sockets.
+std::vector<VideoSource> scan_available_video_sources() {
     std::vector<VideoSource> found;
-    std::unordered_set<std::string> seen_paths;
-    const std::string username = get_username();
-    const std::string expected_suffix = "_" + username + ".sock";
-
-    // 1. Search for default/expected paths explicitly for cleanliness
-    const std::vector<std::string> standard_streams = {"left", "right", "stereo", "overlay"};
-    for (const auto& stream : standard_streams) {
-        std::string path = "/tmp/" + viewer_name + "_" + stream + "_" + username + ".sock";
-        if (std::filesystem::exists(path)) {
-            found.push_back(VideoSource{stream, path});
-            seen_paths.insert(path);
-        }
+    for (const auto &name : dvrk_gst::list_sockets()) {
+        found.push_back(VideoSource{video_source_label(name), name});
     }
-
-    // 2. Also search /tmp dynamically for any socket files matching any app name and standard streams
-    try {
-        if (std::filesystem::exists("/tmp")) {
-            for (const auto& entry : std::filesystem::directory_iterator("/tmp")) {
-                std::string filename = entry.path().filename().string();
-                if (filename.length() > expected_suffix.length() &&
-                    filename.compare(filename.length() - expected_suffix.length(), expected_suffix.length(), expected_suffix) == 0) {
-                    
-                    std::string socket_path = entry.path().string();
-                    if (seen_paths.find(socket_path) == seen_paths.end()) {
-                        std::string base = filename.substr(0, filename.length() - expected_suffix.length());
-                        size_t last_und = base.find_last_of('_');
-                        std::string stream = base;
-                        std::string app = viewer_name;
-                        if (last_und != std::string::npos) {
-                            app = base.substr(0, last_und);
-                            stream = base.substr(last_und + 1);
-                        }
-                        
-                        std::string label = stream + " (" + app + ")";
-                        found.push_back(VideoSource{label, socket_path});
-                        seen_paths.insert(socket_path);
-                    }
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Warning scanning /tmp for video sources: " << e.what() << std::endl;
-    }
-
-    // 3. Scan /proc/net/unix for active abstract sockets matching the naming scheme
-    try {
-        std::ifstream proc_file("/proc/net/unix");
-        if (proc_file.is_open()) {
-            std::string line;
-            while (std::getline(proc_file, line)) {
-                size_t at_pos = line.rfind('@');
-                if (at_pos != std::string::npos && at_pos > 0 && (line[at_pos-1] == ' ' || line[at_pos-1] == '\t')) {
-                    std::string socket_path = line.substr(at_pos + 1);
-                    while (!socket_path.empty() && std::isspace(socket_path.back())) {
-                        socket_path.pop_back();
-                    }
-                    if (socket_path.length() > expected_suffix.length() &&
-                        socket_path.compare(socket_path.length() - expected_suffix.length(), expected_suffix.length(), expected_suffix) == 0) {
-                        
-                        if (seen_paths.find(socket_path) == seen_paths.end()) {
-                            size_t slash_pos = socket_path.find_last_of('/');
-                            std::string filename = (slash_pos == std::string::npos) ? socket_path : socket_path.substr(slash_pos + 1);
-                            
-                            std::string base = filename.substr(0, filename.length() - expected_suffix.length());
-                            size_t last_und = base.find_last_of('_');
-                            std::string stream = base;
-                            std::string app = viewer_name;
-                            if (last_und != std::string::npos) {
-                                app = base.substr(0, last_und);
-                                stream = base.substr(last_und + 1);
-                            }
-                            
-                            std::string label = stream + " (" + app + ")";
-                            found.push_back(VideoSource{label, socket_path});
-                            seen_paths.insert(socket_path);
-                        }
-                    }
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Warning scanning /proc/net/unix for abstract video sources: " << e.what() << std::endl;
-    }
-
-    std::sort(found.begin(), found.end(), [](const VideoSource& a, const VideoSource& b) {
-        return a.label < b.label;
-    });
-
+    std::sort(found.begin(), found.end(),
+              [](const VideoSource &a, const VideoSource &b) {
+                  return a.label < b.label;
+              });
     return found;
 }
 
@@ -756,7 +657,7 @@ private:
 
         close_video_source();
 
-        std::string pipe_str = "unixfdsrc socket-path=" + path + " socket-type=abstract do-timestamp=true "
+        std::string pipe_str = "unixfdsrc socket-path=" + dvrk_gst::to_gst_path(path) + " socket-type=abstract do-timestamp=true "
             "! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream "
             "! videoconvert ! gtksink name=sink";
 
@@ -1256,7 +1157,7 @@ private:
             seen_paths.insert(src.socket_path);
         }
 
-        std::vector<VideoSource> discovered = scan_available_video_sources(m_settings_name);
+        std::vector<VideoSource> discovered = scan_available_video_sources();
         for (const auto& ds : discovered) {
             if (seen_paths.find(ds.socket_path) == seen_paths.end()) {
                 new_sources.push_back(ds);
@@ -1691,14 +1592,14 @@ int main(int argc, char* argv[]) {
     std::vector<VideoSource> video_sources;
     std::unordered_set<std::string> seen_paths;
     for (const auto& source : config.video_sources) {
-        VideoSource vs = make_video_source(config.name, source);
-        if (seen_paths.find(vs.socket_path) == seen_paths.end()) {
-            video_sources.push_back(vs);
-            seen_paths.insert(vs.socket_path);
+        const std::string abstract_name = resolve_video_source_path(source);
+        if (seen_paths.find(abstract_name) == seen_paths.end()) {
+            video_sources.push_back(VideoSource{video_source_label(abstract_name), abstract_name});
+            seen_paths.insert(abstract_name);
         }
     }
 
-    std::vector<VideoSource> discovered = scan_available_video_sources(config.name);
+    std::vector<VideoSource> discovered = scan_available_video_sources();
     for (const auto& ds : discovered) {
         if (seen_paths.find(ds.socket_path) == seen_paths.end()) {
             video_sources.push_back(ds);

@@ -28,14 +28,13 @@
 #include <filesystem>
 #include <iostream>
 #include <mutex>
-#include <pwd.h>
 #include <string>
-#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <dvrk_data/config.hpp>
+#include <dvrk_data/dvrk_gst_socket.hpp>
 #include "display_output_panel.hpp"
 #include <dvrk_data/gst_utils.hpp>
 #include "overlay.hpp"
@@ -199,39 +198,18 @@ std::string get_unixfd_upload_chain() {
   return "gldownload ! videoconvert ! video/x-raw,format=I420";
 }
 
-std::string resolve_unixfd_socket_path(const std::string &app_name,
-                                       const sv::UnixfdSinkConfig &sink) {
-  if (!sink.socket_path.empty()) {
-    return sink.socket_path;
-  }
-  const char *username = getenv("USER");
-  if (!username) {
-    struct passwd *pw = getpwuid(getuid());
-    username = pw ? pw->pw_name : "unknown";
-  }
-  const std::string suffix = sink.name.empty() ? sink.stream : sink.name;
-  return "/tmp/" + app_name + "_" + suffix + "_" + std::string(username) + ".sock";
-}
-
-
+/// Warn if any declared unixfd source socket is not yet active.
 void warn_missing_unixfd_source_sockets(const sv::AppConfig &cfg,
                                         const rclcpp::Logger &logger) {
   for (const auto &src : cfg.unixfd_sources) {
-    const char *username = getenv("USER");
-    if (!username) {
-      struct passwd *pw = getpwuid(getuid());
-      username = pw ? pw->pw_name : "unknown";
-    }
-    const std::string path = src.socket_path.empty()
-        ? "/tmp/" + cfg.name + "_" + src.name + "_" + std::string(username) + ".sock"
-        : src.socket_path;
-    if (!std::filesystem::exists(path)) {
+    const std::string abstract_name =
+        dvrk_gst::resolve(src.socket, dvrk_gst::ROLE_STEREO_ALIGNMENT);
+    if (!dvrk_gst::check_socket(abstract_name, std::cerr)) {
       RCLCPP_WARN(
           logger,
-          "unixfd source socket is missing before pipeline start: %s. "
-          "Start the producer for this socket first; otherwise the display "
-          "sinks can remain idle.",
-          path.c_str());
+          "unixfd source socket not yet active: %s. "
+          "Start the producer first; otherwise the display sinks can remain idle.",
+          abstract_name.c_str());
     }
   }
 }
@@ -369,12 +347,14 @@ void attach_timestamp_probes(GstElement *pipeline, const sv::AppConfig &cfg,
   int stereo_index = 0;
   int overlay_index = 0;
   for (const auto &sink : cfg.unixfd_sinks) {
-    if (sink.stream == "stereo") {
+    const std::string abstract_name = dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
+    const std::string short_name = abstract_name.substr(abstract_name.rfind(':') + 1);
+    if (short_name == "stereo") {
       add_timestamp_probe(
           pipeline,
           "__stereo_unixfd_ts_q" + std::to_string(stereo_index++) + "__",
           timestamp_state);
-    } else if (sink.stream == "overlay") {
+    } else if (short_name == "overlay") {
       add_timestamp_probe(
           pipeline,
           "__overlay_unixfd_ts_q" + std::to_string(overlay_index++) + "__",
@@ -422,8 +402,8 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
   const int n_extra_streams = n_mono + n_stereo;
   const bool has_extra = n_extra_streams > 0 && es.scale > 0.01;
   const bool has_ar = stereo.ar.enabled &&
-                      (!stereo.ar.left_socket.empty() ||
-                       !stereo.ar.right_socket.empty());
+                      (!stereo.ar.left.empty() ||
+                       !stereo.ar.right.empty());
   const bool split_stereo_for_presentation = has_extra || has_ar;
 
   int stereo_h = eye_h;
@@ -508,7 +488,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
         " top=0 bottom=0 ! video/x-raw,width=" + std::to_string(eye_w) +
         ",height=" + std::to_string(eye_h) + " ! glupload";
 
-    if (stereo.ar.enabled && !stereo.ar.left_socket.empty()) {
+    if (stereo.ar.enabled && !stereo.ar.left.empty()) {
       left_chain += " ! left_ar_mix.sink_0 ";
       left_chain +=
           "glvideomixer name=left_ar_mix background=1 force-live=true"
@@ -528,7 +508,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
                     " target-b=" + std::to_string(stereo.ar.color_key_b);
       }
       left_chain +=
-          "unixfdsrc name=left_ar_src socket-path=" + stereo.ar.left_socket +
+          "unixfdsrc name=left_ar_src socket-path=" + dvrk_gst::to_gst_path(stereo.ar.left) +
           " socket-type=abstract do-timestamp=true"
           " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
           " leaky=downstream"
@@ -549,7 +529,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
         std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
         " ! glupload";
 
-    if (stereo.ar.enabled && !stereo.ar.right_socket.empty()) {
+    if (stereo.ar.enabled && !stereo.ar.right.empty()) {
       right_chain += " ! right_ar_mix.sink_0 ";
       right_chain +=
           "glvideomixer name=right_ar_mix background=1 force-live=true"
@@ -569,7 +549,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
                     " target-b=" + std::to_string(stereo.ar.color_key_b);
       }
       right_chain +=
-          "unixfdsrc name=right_ar_src socket-path=" + stereo.ar.right_socket +
+          "unixfdsrc name=right_ar_src socket-path=" + dvrk_gst::to_gst_path(stereo.ar.right) +
           " socket-type=abstract do-timestamp=true"
           " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
           " leaky=downstream"
@@ -604,9 +584,15 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
   std::vector<sv::UnixfdSinkConfig> stereo_unixfd_sinks;
   std::vector<sv::UnixfdSinkConfig> overlay_unixfd_sinks;
   for (const auto &sink : stereo.unixfd_sinks) {
-    if (sink.stream == "stereo") {
+    const std::string resolved =
+        dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
+    // Classify by the short name (last ':' component).
+    const auto colon = resolved.rfind(':');
+    const std::string short_name =
+        (colon != std::string::npos) ? resolved.substr(colon + 1) : resolved;
+    if (short_name == "stereo") {
       stereo_unixfd_sinks.push_back(sink);
-    } else if (sink.stream == "overlay") {
+    } else if (short_name == "overlay") {
       overlay_unixfd_sinks.push_back(sink);
     }
   }
@@ -758,8 +744,8 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
 
     int stereo_unixfd_index = 0;
     for (const auto &sink : stereo_unixfd_sinks) {
-      const std::string socket_path =
-          resolve_unixfd_socket_path(stereo.name, sink);
+      const std::string abstract_name =
+          dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
       if (stereo_branches > 1) {
         output_chain +=
             " __stereo_out__. ! queue max-size-buffers=2 max-size-time=0 "
@@ -773,8 +759,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
           get_unixfd_upload_chain() + " ! queue name=__stereo_unixfd_ts_q" +
           std::to_string(stereo_unixfd_index++) +
           "__ max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
-          "leaky=downstream ! unixfdsink socket-path=" +
-          socket_path + " socket-type=abstract sync=false async=false";
+          "leaky=downstream ! " + dvrk_gst::build_sink(abstract_name);
     }
 
     if (!overlay_unixfd_sinks.empty()) {
@@ -797,8 +782,8 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
 
       int overlay_unixfd_index = 0;
       for (const auto &sink : overlay_unixfd_sinks) {
-        const std::string socket_path =
-            resolve_unixfd_socket_path(stereo.name, sink);
+        const std::string abstract_name =
+            dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
         if (overlay_unixfd_sinks.size() > 1) {
           output_chain +=
               " __overlay_out__. ! queue max-size-buffers=2 "
@@ -811,8 +796,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
             " ! queue name=__overlay_unixfd_ts_q" +
             std::to_string(overlay_unixfd_index++) +
             "__ max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
-            "leaky=downstream ! unixfdsink socket-path=" +
-            socket_path + " socket-type=abstract sync=false async=false";
+            "leaky=downstream ! " + dvrk_gst::build_sink(abstract_name);
       }
     }
   } else {
@@ -1146,29 +1130,32 @@ int main(int argc, char *argv[]) {
 
   // Populate cfg.stereo.source from unixfdsources "stereo" entry when
   // stereo.stream was not set explicitly in the config.
+  // Build stereo.source from stereo.socket or unixfd_sources entry.
   if (cfg.stereo.source.empty()) {
-    for (const auto &src : cfg.unixfd_sources) {
-      if (src.name != "stereo") continue;
-      const char *username = getenv("USER");
-      if (!username) {
-        struct passwd *pw = getpwuid(getuid());
-        username = pw ? pw->pw_name : "unknown";
+    // Try stereo.socket field first (new convention).
+    if (!cfg.stereo.socket.empty()) {
+      const std::string abstract_name =
+          dvrk_gst::resolve(cfg.stereo.socket, dvrk_gst::ROLE_STEREO_ALIGNMENT);
+      cfg.stereo.source =
+          dvrk_gst::build_src(abstract_name, 2 * cfg.original_width,
+                              cfg.original_height);
+      RCLCPP_INFO(node->get_logger(), "Stereo source: %s", abstract_name.c_str());
+    } else {
+      // Fall back to unixfd_sources list (legacy / explicit socket path).
+      for (const auto &src : cfg.unixfd_sources) {
+        const std::string abstract_name =
+            dvrk_gst::resolve(src.socket, dvrk_gst::ROLE_STEREO_ALIGNMENT);
+        cfg.stereo.source =
+            dvrk_gst::build_src(abstract_name, 2 * cfg.original_width,
+                                cfg.original_height);
+        RCLCPP_INFO(node->get_logger(), "Stereo source: %s",
+                    abstract_name.c_str());
+        break;
       }
-      const std::string socket_path = src.socket_path.empty()
-          ? "/tmp/" + cfg.name + "_" + src.name + "_" + std::string(username) + ".sock"
-          : src.socket_path;
-      cfg.stereo.source = "unixfdsrc socket-path=" + socket_path +
-          " socket-type=abstract do-timestamp=true ! video/x-raw,format=I420,width=" +
-          std::to_string(2 * cfg.original_width) +
-          ",height=" + std::to_string(cfg.original_height);
-      RCLCPP_INFO(node->get_logger(),
-                  "Stereo source: %s", socket_path.c_str());
-      break;
     }
     if (cfg.stereo.source.empty()) {
       RCLCPP_ERROR(node->get_logger(),
-                   "Config '%s' must define either stereo.stream or a "
-                   "unixfdsources entry with name \"stereo\"",
+                   "Config '%s' must define stereo.socket or stereo.stream",
                    cfg.name.c_str());
       rclcpp::shutdown();
       return 1;
@@ -1182,10 +1169,8 @@ int main(int argc, char *argv[]) {
   const std::string unixfd_upload_chain = get_unixfd_upload_chain();
   if (!app_cfg.unixfd_sinks.empty()) {
     for (const auto &sink : app_cfg.unixfd_sinks) {
-      const std::string socket_path =
-          resolve_unixfd_socket_path(app_cfg.name, sink);
-      RCLCPP_INFO(node->get_logger(), "unixfd sink: stream=%s path=%s",
-                  sink.stream.c_str(), socket_path.c_str());
+      RCLCPP_INFO(node->get_logger(), "unixfd sink: %s",
+                  dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY).c_str());
     }
   } else {
     RCLCPP_INFO(node->get_logger(), "No unixfd sinks configured");
@@ -1573,21 +1558,7 @@ int main(int argc, char *argv[]) {
                        [&rebuild_pipeline](double s) { rebuild_pipeline(s); });
   control_window_ptr = &window;
 
-  for (const auto &sink : app_cfg.unixfd_sinks) {
-    const std::string socket_path =
-        resolve_unixfd_socket_path(app_cfg.name, sink);
-    if (std::filesystem::exists(socket_path)) {
-      RCLCPP_INFO(node->get_logger(),
-                  "Removing stale unixfd socket before starting pipeline: %s",
-                  socket_path.c_str());
-      std::error_code remove_error;
-      if (!std::filesystem::remove(socket_path, remove_error) && remove_error) {
-        RCLCPP_WARN(node->get_logger(),
-                    "Unable to remove stale unixfd socket '%s': %s",
-                    socket_path.c_str(), remove_error.message().c_str());
-      }
-    }
-  }
+  // Abstract sockets are kernel-managed — no stale file cleanup needed.
 
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
   RCLCPP_INFO(node->get_logger(), "Stereo display pipeline started");

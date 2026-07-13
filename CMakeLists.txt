@@ -96,7 +96,7 @@ install(TARGETS
 )
 
 install(PROGRAMS
-  scripts/stereo_calibrate
+  scripts/stereo_display_calibration
   DESTINATION lib/${PROJECT_NAME}
 )
 
