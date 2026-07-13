@@ -10,6 +10,10 @@ namespace sv {
 void draw_status_circle(cairo_t *cr, int status, double cx, double cy,
                         double radius, double alpha, const OverlayTheme &theme);
 
+void draw_focus_pedal(cairo_t *cr, int focus_minus_status,
+                      int focus_plus_status, double cx, double cy,
+                      double radius, double alpha, const OverlayTheme &theme);
+
 void draw_numbered_circle(cairo_t *cr, bool active, bool valid, int number,
                           double cx, double cy, double radius, double alpha,
                           const OverlayTheme &theme);

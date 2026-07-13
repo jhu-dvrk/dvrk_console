@@ -58,6 +58,10 @@ struct ArmOverlayInfo {
 struct OverlayState {
     ButtonState camera;
     ButtonState clutch;
+    ButtonState focus_minus;
+    ButtonState focus_plus;
+    ButtonState coag;
+    ButtonState bicoag;
     ButtonState operator_present;
 
     int frame_width = 0;
@@ -126,6 +130,26 @@ void on_camera_joy(
 );
 
 void on_clutch_joy(
+    const sensor_msgs::msg::Joy::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_focus_minus_joy(
+    const sensor_msgs::msg::Joy::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_focus_plus_joy(
+    const sensor_msgs::msg::Joy::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_coag_joy(
+    const sensor_msgs::msg::Joy::SharedPtr msg,
+    const std::shared_ptr<OverlayState>& overlay_state
+);
+
+void on_bicoag_joy(
     const sensor_msgs::msg::Joy::SharedPtr msg,
     const std::shared_ptr<OverlayState>& overlay_state
 );

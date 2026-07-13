@@ -303,6 +303,30 @@ void on_clutch_joy(const sensor_msgs::msg::Joy::SharedPtr msg,
   update_button_state(msg, overlay_state->clutch);
 }
 
+void on_focus_minus_joy(const sensor_msgs::msg::Joy::SharedPtr msg,
+                        const std::shared_ptr<OverlayState> &overlay_state) {
+  std::scoped_lock<std::mutex> lock(overlay_state->mutex);
+  update_button_state(msg, overlay_state->focus_minus);
+}
+
+void on_focus_plus_joy(const sensor_msgs::msg::Joy::SharedPtr msg,
+                       const std::shared_ptr<OverlayState> &overlay_state) {
+  std::scoped_lock<std::mutex> lock(overlay_state->mutex);
+  update_button_state(msg, overlay_state->focus_plus);
+}
+
+void on_coag_joy(const sensor_msgs::msg::Joy::SharedPtr msg,
+                 const std::shared_ptr<OverlayState> &overlay_state) {
+  std::scoped_lock<std::mutex> lock(overlay_state->mutex);
+  update_button_state(msg, overlay_state->coag);
+}
+
+void on_bicoag_joy(const sensor_msgs::msg::Joy::SharedPtr msg,
+                   const std::shared_ptr<OverlayState> &overlay_state) {
+  std::scoped_lock<std::mutex> lock(overlay_state->mutex);
+  update_button_state(msg, overlay_state->bicoag);
+}
+
 void on_operator_present(const sensor_msgs::msg::Joy::SharedPtr msg,
                          const std::shared_ptr<OverlayState> &overlay_state) {
   std::scoped_lock<std::mutex> lock(overlay_state->mutex);
@@ -358,6 +382,10 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   auto *overlay_state = static_cast<OverlayState *>(user_data);
   int camera_status = 0;
   int clutch_status = 0;
+  int focus_minus_status = 0;
+  int focus_plus_status = 0;
+  int coag_status = 0;
+  int bicoag_status = 0;
   bool has_operator_present = false;
   int operator_present_status = 0;
   int frame_width = 0;
@@ -381,6 +409,17 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
         overlay_state->camera.present ? overlay_state->camera.get_status() : 0;
     clutch_status =
         overlay_state->clutch.present ? overlay_state->clutch.get_status() : 0;
+    focus_minus_status = overlay_state->focus_minus.present
+                             ? overlay_state->focus_minus.get_status()
+                             : 0;
+    focus_plus_status = overlay_state->focus_plus.present
+                            ? overlay_state->focus_plus.get_status()
+                            : 0;
+    coag_status =
+        overlay_state->coag.present ? overlay_state->coag.get_status() : 0;
+    bicoag_status = overlay_state->bicoag.present
+                        ? overlay_state->bicoag.get_status()
+                        : 0;
     has_operator_present = overlay_state->operator_present.present;
     operator_present_status = overlay_state->operator_present.present
                                   ? overlay_state->operator_present.get_status()
@@ -509,36 +548,34 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   const double cy =
       static_cast<double>(frame_height) - theme.bottom_bar_height * 0.5;
 
+  const auto draw_pedal_row = [&](double center_cx, double scale) {
+    const double pedal_step =
+        (theme.h_spacing * 2.0 + theme.radius * 2.0) * scale;
+    draw_status_circle(cr, clutch_status, center_cx - 2.0 * pedal_step, cy,
+                       theme.radius, overlay_alpha, theme);
+    draw_status_circle(cr, camera_status, center_cx - pedal_step, cy,
+                       theme.radius, overlay_alpha, theme);
+    draw_focus_pedal(cr, focus_minus_status, focus_plus_status, center_cx, cy,
+                     theme.radius, overlay_alpha, theme);
+    draw_status_circle(cr, bicoag_status, center_cx + pedal_step, cy,
+                       theme.radius, overlay_alpha, theme);
+    draw_status_circle(cr, coag_status, center_cx + 2.0 * pedal_step, cy,
+                       theme.radius, overlay_alpha, theme);
+  };
+
   if (is_stereo_layout) {
     const double left_baseline_cx =
         (eye_width / 2.0) -
         static_cast<double>(display_horizontal_offset_px) / 2.0;
-    const double left_cx = left_baseline_cx;
-    const double pedal_offset = (theme.h_spacing + theme.radius * 2.0) * 0.5;
-    draw_status_circle(cr, clutch_status,
-                       left_cx - pedal_offset * horizontal_ui_scale, cy,
-                       theme.radius, overlay_alpha, theme);
-    draw_status_circle(cr, camera_status,
-                       left_cx + pedal_offset * horizontal_ui_scale, cy,
-                       theme.radius, overlay_alpha, theme);
+    draw_pedal_row(left_baseline_cx, horizontal_ui_scale);
 
     const double right_baseline_cx =
       eye_width + (eye_width / 2.0) +
       static_cast<double>(display_horizontal_offset_px) / 2.0;
-    const double right_cx = right_baseline_cx;
-    draw_status_circle(cr, clutch_status,
-                       right_cx - pedal_offset * horizontal_ui_scale, cy,
-                       theme.radius, overlay_alpha, theme);
-    draw_status_circle(cr, camera_status,
-                       right_cx + pedal_offset * horizontal_ui_scale, cy,
-                       theme.radius, overlay_alpha, theme);
+    draw_pedal_row(right_baseline_cx, horizontal_ui_scale);
   } else {
     const double center_cx = static_cast<double>(frame_width) / 2.0;
-    const double pedal_offset = (theme.h_spacing + theme.radius * 2.0) * 0.5;
-    draw_status_circle(cr, clutch_status, center_cx - pedal_offset, cy,
-                       theme.radius, overlay_alpha, theme);
-    draw_status_circle(cr, camera_status, center_cx + pedal_offset, cy,
-                       theme.radius, overlay_alpha, theme);
+    draw_pedal_row(center_cx, 1.0);
   }
 
   std::sort(left_teleops.begin(), left_teleops.end(),

@@ -1189,6 +1189,12 @@ int main(int argc, char *argv[]) {
 
   const std::string camera_topic = "/" + console_name + "/camera";
   const std::string clutch_topic = "/" + console_name + "/clutch";
+  const std::string focus_minus_topic =
+      "/" + console_name + "/focus_minus";
+  const std::string focus_plus_topic =
+      "/" + console_name + "/focus_plus";
+  const std::string coag_topic = "/" + console_name + "/coag";
+  const std::string bicoag_topic = "/" + console_name + "/bicoag";
   const std::string operator_present_topic =
       "/" + console_name + "/operator_present";
   const std::string teleop_selected_topic =
@@ -1197,10 +1203,14 @@ int main(int argc, char *argv[]) {
       "/" + console_name + "/teleop/unselected";
   RCLCPP_INFO(node->get_logger(),
               "Console topics: camera=%s clutch=%s operator_present=%s "
+              "focus_minus=%s focus_plus=%s bicoag=%s coag=%s "
               "teleop_selected=%s "
               "teleop_unselected=%s",
               camera_topic.c_str(), clutch_topic.c_str(),
-              operator_present_topic.c_str(), teleop_selected_topic.c_str(),
+              operator_present_topic.c_str(), focus_minus_topic.c_str(),
+              focus_plus_topic.c_str(),
+              bicoag_topic.c_str(), coag_topic.c_str(),
+              teleop_selected_topic.c_str(),
               teleop_unselected_topic.c_str());
 
   const auto latch_qos =
@@ -1220,6 +1230,30 @@ int main(int argc, char *argv[]) {
       clutch_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
         sv::on_clutch_joy(msg, overlay_state);
+      });
+
+  auto focus_minus_sub = node->create_subscription<sensor_msgs::msg::Joy>(
+      focus_minus_topic, latch_qos,
+      [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
+        sv::on_focus_minus_joy(msg, overlay_state);
+      });
+
+  auto focus_plus_sub = node->create_subscription<sensor_msgs::msg::Joy>(
+      focus_plus_topic, latch_qos,
+      [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
+        sv::on_focus_plus_joy(msg, overlay_state);
+      });
+
+  auto bicoag_sub = node->create_subscription<sensor_msgs::msg::Joy>(
+      bicoag_topic, latch_qos,
+      [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
+        sv::on_bicoag_joy(msg, overlay_state);
+      });
+
+  auto coag_sub = node->create_subscription<sensor_msgs::msg::Joy>(
+      coag_topic, latch_qos,
+      [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
+        sv::on_coag_joy(msg, overlay_state);
       });
 
   auto operator_present_sub = node->create_subscription<sensor_msgs::msg::Joy>(

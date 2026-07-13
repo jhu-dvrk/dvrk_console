@@ -5,34 +5,117 @@
 
 namespace sv {
 
+namespace {
+
+void append_pedal_path(cairo_t *cr, double cx, double cy, double radius,
+                       double corner_radius) {
+  const double half_width = radius * 0.6; // width reduced by 40%
+  cairo_new_path(cr);
+  // Top: perfect semicircle of radius half_width
+  cairo_arc(cr, cx, cy, half_width, M_PI, 0.0);
+  // Right side straight down, then bottom-right rounded corner
+  cairo_line_to(cr, cx + half_width, cy + radius - corner_radius);
+  cairo_arc(cr, cx + half_width - corner_radius, cy + radius - corner_radius,
+            corner_radius, 0.0, 0.5 * M_PI);
+  // Bottom edge, then bottom-left rounded corner
+  cairo_line_to(cr, cx - half_width + corner_radius, cy + radius);
+  cairo_arc(cr, cx - half_width + corner_radius, cy + radius - corner_radius,
+            corner_radius, 0.5 * M_PI, M_PI);
+  cairo_close_path(cr);
+}
+
+void append_focus_pedal_path(cairo_t *cr, double cx, double cy,
+                             double radius) {
+  // Stadium shape: top and bottom semicircles of radius half_width,
+  // with a straight rectangular section in between. Total height = 2*radius.
+  const double half_width = radius * 0.6; // width reduced by 40%
+  const double rect_half_height = radius - half_width;
+  cairo_new_path(cr);
+  // Top semicircle (left -> right, arching upward)
+  cairo_arc(cr, cx, cy - rect_half_height, half_width, M_PI, 0.0);
+  // Right side down to bottom semicircle
+  cairo_line_to(cr, cx + half_width, cy + rect_half_height);
+  // Bottom semicircle (right -> left, arching downward)
+  cairo_arc(cr, cx, cy + rect_half_height, half_width, 0.0, M_PI);
+  cairo_close_path(cr);
+}
+
+void set_button_fill(cairo_t *cr, int status, double alpha,
+                     const OverlayTheme &theme) {
+  if (status == 2) {
+    set_source_rgba(cr, theme.active_green, alpha);
+  } else {
+    set_source_rgba(cr, theme.active_grey, alpha);
+  }
+}
+
+void draw_focus_label(cairo_t *cr, const char *label, int status, double cx,
+                      double cy, double radius, double alpha,
+                      const OverlayTheme &theme) {
+  cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
+                         CAIRO_FONT_WEIGHT_BOLD);
+  cairo_set_font_size(cr, radius * 0.9);
+
+  cairo_text_extents_t extents;
+  cairo_text_extents(cr, label, &extents);
+  cairo_move_to(cr, cx - (extents.width * 0.5 + extents.x_bearing),
+                cy - (extents.height * 0.5 + extents.y_bearing));
+  set_source_rgba(cr, status != 0 ? theme.text_dark : theme.valid_grey,
+                  alpha);
+  cairo_show_text(cr, label);
+}
+
+} // namespace
+
 void draw_status_circle(cairo_t *cr, int status, double cx, double cy,
                         double radius, double alpha,
                         const OverlayTheme &theme) {
-  cairo_new_path(cr);
-  cairo_move_to(cr, cx - radius, cy);
-  cairo_arc(cr, cx, cy, radius, M_PI, 0.0);
-  cairo_line_to(cr, cx + radius, cy + radius - theme.corner_radius);
-  cairo_arc(cr, cx + radius - theme.corner_radius,
-            cy + radius - theme.corner_radius, theme.corner_radius, 0.0,
-            0.5 * M_PI);
-  cairo_line_to(cr, cx - radius + theme.corner_radius, cy + radius);
-  cairo_arc(cr, cx - radius + theme.corner_radius,
-            cy + radius - theme.corner_radius, theme.corner_radius, 0.5 * M_PI,
-            M_PI);
-  cairo_close_path(cr);
+  append_pedal_path(cr, cx, cy, radius, theme.corner_radius);
 
   if (status != 0) {
-    if (status == 2) {
-      set_source_rgba(cr, theme.active_green, alpha);
-    } else {
-      set_source_rgba(cr, theme.active_grey, alpha);
-    }
+    set_button_fill(cr, status, alpha, theme);
     cairo_fill_preserve(cr);
   }
 
   set_source_rgba(cr, theme.valid_grey, alpha);
   cairo_set_line_width(cr, theme.line_width);
   cairo_stroke(cr);
+}
+
+void draw_focus_pedal(cairo_t *cr, int focus_minus_status,
+                      int focus_plus_status, double cx, double cy,
+                      double radius, double alpha,
+                      const OverlayTheme &theme) {
+  cairo_save(cr);
+  append_focus_pedal_path(cr, cx, cy, radius);
+  cairo_clip(cr);
+
+  if (focus_plus_status != 0) {
+    set_button_fill(cr, focus_plus_status, alpha, theme);
+    cairo_rectangle(cr, cx - radius, cy - radius, 2.0 * radius, radius);
+    cairo_fill(cr);
+  }
+  if (focus_minus_status != 0) {
+    set_button_fill(cr, focus_minus_status, alpha, theme);
+    cairo_rectangle(cr, cx - radius, cy, 2.0 * radius, radius);
+    cairo_fill(cr);
+  }
+  cairo_restore(cr);
+
+  append_focus_pedal_path(cr, cx, cy, radius);
+  set_source_rgba(cr, theme.valid_grey, alpha);
+  cairo_set_line_width(cr, theme.line_width);
+  cairo_stroke(cr);
+
+  const double half_width = radius * 0.6;
+  cairo_move_to(cr, cx - half_width, cy);
+  cairo_line_to(cr, cx + half_width, cy);
+  cairo_stroke(cr);
+
+  draw_focus_label(cr, "+", focus_plus_status, cx, cy - radius * 0.48,
+                   radius, alpha, theme);
+  draw_focus_label(cr, "-", focus_minus_status, cx, cy + radius * 0.48,
+                   radius, alpha, theme);
 }
 
 void draw_numbered_circle(cairo_t *cr, bool active, bool valid, int number,
