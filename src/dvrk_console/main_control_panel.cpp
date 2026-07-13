@@ -236,6 +236,10 @@ public:
         set_title("dVRK Control Panel");
         set_default_size(1024, 600);
 
+        m_monitor_manager = std::make_unique<sv::WindowMonitorManager>(*this, m_settings_name, "control_panel");
+        load_persisted_display_settings();
+        load_persisted_user_settings();
+
         // Apply sleek styling and dynamic CSS provider
         setup_styles();
 
@@ -266,8 +270,6 @@ public:
         // Build right video panel structure and start pipelines AFTER the layout is attached and shown
         setup_right_pane();
 
-        m_monitor_manager = std::make_unique<sv::WindowMonitorManager>(*this, m_settings_name, "control_panel");
-        load_persisted_display_settings();
         if (m_have_persisted_display_settings) {
             Glib::signal_idle().connect_once([this]() {
                 apply_window_display_settings();
@@ -297,6 +299,7 @@ protected:
 
     bool on_delete_event(GdkEventAny* /* any_event */) override {
         save_persisted_display_settings();
+        save_persisted_user_settings();
         hide();
         return true;
     }
@@ -626,7 +629,15 @@ private:
         m_video_area.set_vexpand(true);
         m_right_pane.pack_start(m_video_area, Gtk::PACK_EXPAND_WIDGET, 0);
         if (!m_video_sources.empty()) {
-            open_video_source(m_video_sources[0].socket_path);
+            auto selected = std::find_if(
+                m_video_sources.begin(), m_video_sources.end(),
+                [this](const VideoSource& source) {
+                    return source.socket_path == m_persisted_video_path;
+                });
+            if (selected == m_video_sources.end()) {
+                selected = m_video_sources.begin();
+            }
+            open_video_source(selected->socket_path);
             m_right_pane.show_all();
         } else {
             m_right_pane.hide();
@@ -705,6 +716,7 @@ private:
         m_current_video_widget = mm_widget;
         m_current_video_pipeline = pipeline;
         m_current_video_path = path;
+        save_persisted_user_settings();
         m_right_pane.show_all();
         m_right_pane.show();
         return true;
@@ -1270,6 +1282,59 @@ private:
         }
     }
 
+    void load_persisted_user_settings() {
+        const std::string path = settings_file_path();
+        if (path.empty() || !std::filesystem::exists(path)) {
+            return;
+        }
+
+        try {
+            Glib::KeyFile key_file;
+            key_file.load_from_file(path);
+            if (key_file.has_group("appearance") &&
+                key_file.has_key("appearance", "dark_mode")) {
+                m_dark_mode = key_file.get_boolean("appearance", "dark_mode");
+            }
+            if (key_file.has_group("video") &&
+                key_file.has_key("video", "source")) {
+                m_persisted_video_path =
+                    key_file.get_string("video", "source");
+            }
+        } catch (const Glib::Error& error) {
+            std::cerr << "Warning: unable to load user settings from '"
+                      << path << "': " << error.what() << std::endl;
+        }
+    }
+
+    void save_persisted_user_settings() {
+        const std::string path = settings_file_path();
+        if (path.empty()) {
+            return;
+        }
+
+        try {
+            std::filesystem::create_directories(
+                std::filesystem::path(path).parent_path());
+
+            Glib::KeyFile key_file;
+            if (std::filesystem::exists(path)) {
+                key_file.load_from_file(path);
+            }
+            key_file.set_boolean("appearance", "dark_mode", m_dark_mode);
+            if (!m_current_video_path.empty()) {
+                key_file.set_string("video", "source", m_current_video_path);
+                m_persisted_video_path = m_current_video_path;
+            }
+            Glib::file_set_contents(path, key_file.to_data());
+        } catch (const Glib::Error& error) {
+            std::cerr << "Warning: unable to save user settings: "
+                      << error.what() << std::endl;
+        } catch (const std::exception& error) {
+            std::cerr << "Warning: unable to save user settings: "
+                      << error.what() << std::endl;
+        }
+    }
+
     void apply_window_display_settings() {
         if (m_monitor_manager) {
             m_monitor_manager->set_monitor_index(m_window_monitor_index);
@@ -1295,6 +1360,7 @@ private:
 
     void toggle_dark_mode() {
         m_dark_mode = !m_dark_mode;
+        save_persisted_user_settings();
         if (m_dark_mode) {
             m_color_green.set("#2ec4b6");
             m_color_red.set("#e71d36");
@@ -1523,6 +1589,7 @@ private:
     GstElement* m_current_video_pipeline = nullptr;
     Gtk::Widget* m_current_video_widget = nullptr;
     std::string m_current_video_path;
+    std::string m_persisted_video_path;
     dc_stereo::PipelineUserData m_video_user_data;
 
     // Asynchronous resets
