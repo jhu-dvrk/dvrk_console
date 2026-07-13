@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Interactive calibration tool for the dvrk_console stereo display offset.
+
+This tool previews the live stereo feed with the camera alignment from the
+config applied read-only, and lets the operator interactively adjust the
+display_horizontal_offset_px value that controls how far apart the two eye
+windows are shifted on the surgeon's console display.
+
+Run stereo_alignment_calibration (from dvrk_data) first to calibrate camera
+crop, alignment shifts, and color correction.  Then run this tool to calibrate
+the display offset that positions the stereo image at the surgeon's working
+depth.
+"""
+
+import argparse
+import json
+import os
+import select
+from pathlib import Path
+import sys
+import termios
+import threading
+import time
+import tty
+
+import cv2
+import numpy as np
+
+import crtk
+import dvrk
+
+KEY_QUIT = "q"
+KEY_FULLSCREEN = "f"
+KEY_LINE_LEFT = "["
+KEY_LINE_RIGHT = "]"
+KEY_LINE_TOGGLE = "g"
+KEY_PSM_OSCILLATE = "v"
+
+
+class TerminalInput:
+    def __init__(self):
+        self.old_settings = termios.tcgetattr(sys.stdin)
+
+    def __enter__(self):
+        tty.setcbreak(sys.stdin.fileno())
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+    def get_key(self):
+        key = None
+        while select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                sys.stdin.read(2)  # consume remainder of escape sequence
+                continue
+            if ch in ("q", "Q"):
+                key = KEY_QUIT
+            elif ch in ("f", "F"):
+                key = KEY_FULLSCREEN
+            elif ch == "[":
+                key = KEY_LINE_LEFT
+            elif ch == "]":
+                key = KEY_LINE_RIGHT
+            elif ch in ("g", "G"):
+                key = KEY_LINE_TOGGLE
+            elif ch in ("v", "V"):
+                key = KEY_PSM_OSCILLATE
+        return key
+
+
+def clip_int(value: int, min_value: int, max_value: int) -> int:
+    return max(min_value, min(max_value, value))
+
+
+def compute_axis_starts(crop_total: int, offset_px: int):
+    center = crop_total // 2
+    negative_start = center - int(np.floor(offset_px / 2.0))
+    positive_start = center + int(np.ceil(offset_px / 2.0))
+    return negative_start, positive_start
+
+
+def compute_eye_crop(working_w: int, working_h: int, crop_w: int, crop_h: int,
+                     horizontal_shift: int, vertical_shift: int, sign: int):
+    crop_x_total = max(0, working_w - crop_w)
+    crop_y_total = max(0, working_h - crop_h)
+    left_start, right_start = compute_axis_starts(crop_x_total, horizontal_shift)
+    top_start, bottom_start = compute_axis_starts(crop_y_total, vertical_shift)
+    left_crop = left_start if sign < 0 else right_start
+    right_crop = crop_x_total - left_crop
+    top_crop = top_start if sign < 0 else bottom_start
+    bottom_crop = crop_y_total - top_crop
+    return left_crop, right_crop, top_crop, bottom_crop
+
+
+def crop_frame(frame, crop):
+    left_crop, right_crop, top_crop, bottom_crop = crop
+    height, width = frame.shape[:2]
+    return frame[top_crop:height - bottom_crop, left_crop:width - right_crop]
+
+
+def apply_color_calibration_preview(bgr, color_params):
+    brightness = color_params.get("brightness", 0.0)
+    contrast = color_params.get("contrast", 1.0)
+    saturation = color_params.get("saturation", 1.0)
+    if brightness == 0.0 and contrast == 1.0 and saturation == 1.0:
+        return bgr
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation, 0, 255)
+    hsv[:, :, 2] = np.clip((hsv[:, :, 2] - 16) * contrast + 16 + brightness * 255.0, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def as_preview_pipeline(source_snippet: str) -> str:
+    snippet = source_snippet.strip()
+    if "appsink" in snippet:
+        return snippet
+    return f"{snippet} ! videoconvert ! appsink drop=true sync=false"
+
+
+def open_capture(source_label: str, source_snippet: str):
+    pipeline = as_preview_pipeline(source_snippet)
+    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Unable to open {source_label} source with GStreamer backend.\n"
+            f"Pipeline: {pipeline}"
+        )
+    return cap
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Interactive dvrk_console stereo display offset calibration tool. "
+            "Applies camera alignment from the config read-only and lets the "
+            "operator tune display_horizontal_offset_px interactively."
+        )
+    )
+    parser.add_argument("-c", "--config", required=True, help="Path to dvrk_console JSON config")
+    parser.add_argument("-s", "--split", action="store_true", help="Split stereo view in two windows")
+    parser.add_argument("-p", "--psm", help="PSM name to oscillate while verifying display depth (e.g. PSM1)")
+    return parser.parse_args()
+
+
+def interactive_display_tune(config, split_mode=False, psm_name=None):
+    cam_cfg = config.get("camera", {})
+    left_stream = cam_cfg.get("left", {}).get("stream", "").strip()
+    right_stream = cam_cfg.get("right", {}).get("stream", "").strip()
+    if not left_stream or not right_stream:
+        raise RuntimeError("camera.left.stream and camera.right.stream must be set in the config")
+
+    # Read camera geometry from config (read-only — use stereo_alignment_calibration to change these)
+    cam_size = cam_cfg.get("size", {})
+    original_w = int(cam_size.get("width", 0))
+    original_h = int(cam_size.get("height", 0))
+    cam_crop = cam_cfg.get("crop", {})
+    crop_w = int(cam_crop.get("width", original_w)) or original_w
+    crop_h = int(cam_crop.get("height", original_h)) or original_h
+    cam_align = cam_cfg.get("alignment", {})
+    horizontal_shift = int(cam_align.get("horizontal_shift_px", 0))
+    vertical_shift = int(cam_align.get("vertical_shift_px", 0))
+    left_color = cam_cfg.get("left", {}).get("color", {})
+    right_color = cam_cfg.get("right", {}).get("color", {})
+
+    display_horizontal_offset = int(config.get("display_horizontal_offset_px", 0))
+    show_grid = False
+
+    # PSM oscillation setup
+    ral = None
+    arm = None
+    oscillating = False
+    oscillation_start_time = 0.0
+    oscillation_amplitude = np.pi / 4.0
+    oscillation_frequency = 0.5
+    initial_jp = None
+    oscillation_lock = threading.Lock()
+
+    def oscillation_thread():
+        nonlocal oscillating, oscillation_start_time, initial_jp
+        rate = ral.create_rate(500)
+        while rclpy.ok():
+            with oscillation_lock:
+                is_oscillating = oscillating
+                start_time = oscillation_start_time
+                base_jp = initial_jp
+            if is_oscillating and arm:
+                elapsed = time.time() - start_time
+                offset = oscillation_amplitude * np.sin(2 * np.pi * oscillation_frequency * elapsed)
+                target_jp = np.copy(base_jp)
+                target_jp[3] = base_jp[3] + offset
+                arm.servo_jp(target_jp)
+            rate.sleep()
+
+    if psm_name:
+        import rclpy
+        if not rclpy.ok():
+            rclpy.init()
+        ral = crtk.ral("dvrk_display_calibration")
+        arm = dvrk.psm(ral, psm_name)
+        ral.spin()
+        time.sleep(0.5)
+        t_osc = threading.Thread(target=oscillation_thread, daemon=True)
+        t_osc.start()
+
+    left_cap = open_capture("left", left_stream)
+    right_cap = open_capture("right", right_stream)
+
+    ok_left, left_frame = left_cap.read()
+    ok_right, right_frame = right_cap.read()
+    if not ok_left or left_frame is None or not ok_right or right_frame is None:
+        raise RuntimeError("Unable to read first frame from one or both GStreamer sources")
+
+    left_h, left_w = left_frame.shape[:2]
+    right_h, right_w = right_frame.shape[:2]
+    if original_w <= 0:
+        original_w = min(left_w, right_w)
+    if original_h <= 0:
+        original_h = min(left_h, right_h)
+    if crop_w <= 0 or crop_w > original_w:
+        crop_w = original_w
+    if crop_h <= 0 or crop_h > original_h:
+        crop_h = original_h
+
+    window_name = "stereo_preview"
+    left_window_name = "left_preview"
+    right_window_name = "right_preview"
+
+    if split_mode:
+        cv2.namedWindow(left_window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
+        cv2.resizeWindow(left_window_name, max(640, crop_w), max(360, crop_h))
+        cv2.namedWindow(right_window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
+        cv2.resizeWindow(right_window_name, max(640, crop_w), max(360, crop_h))
+    else:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
+        cv2.resizeWindow(window_name, max(960, 2 * crop_w), max(360, crop_h))
+
+    print(f"Camera: {original_w}x{original_h}  crop: {crop_w}x{crop_h}  "
+          f"h_shift: {horizontal_shift}  v_shift: {vertical_shift}")
+    print("Controls: [/]:display_offset  g:grid  f:fullscreen  v:PSM oscillation  q:quit")
+
+    grid_rows = 3
+    grid_cols = 4
+    grid_colors = [tuple(np.random.randint(0, 256, 3).tolist()) for _ in range(grid_rows * grid_cols)]
+    preview_fullscreen = False
+
+    with TerminalInput() as term:
+        while True:
+            ok_left, left_frame = left_cap.read()
+            ok_right, right_frame = right_cap.read()
+            if not ok_left or left_frame is None:
+                left_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok_left, left_frame = left_cap.read()
+            if not ok_right or right_frame is None:
+                right_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok_right, right_frame = right_cap.read()
+            if not ok_left or not ok_right or left_frame is None or right_frame is None:
+                continue
+
+            # Apply camera alignment read-only
+            left_base = left_frame[:original_h, :original_w]
+            right_base = right_frame[:original_h, :original_w]
+            left_out = crop_frame(left_base, compute_eye_crop(original_w, original_h, crop_w, crop_h, horizontal_shift, vertical_shift, sign=-1))
+            right_out = crop_frame(right_base, compute_eye_crop(original_w, original_h, crop_w, crop_h, horizontal_shift, vertical_shift, sign=1))
+            if left_out.size == 0 or right_out.size == 0:
+                continue
+
+            left_preview = apply_color_calibration_preview(left_out, left_color)
+            right_preview = apply_color_calibration_preview(right_out, right_color)
+
+            if show_grid:
+                curr_h, curr_w = left_preview.shape[:2]
+                center_x = curr_w // 2
+                square_size = int(curr_h * 0.05)
+                span_w = int(curr_w * 0.8)
+                span_h = int(curr_h * 0.8)
+                padding_x = (span_w - grid_cols * square_size) // (grid_cols - 1)
+                padding_y = (span_h - grid_rows * square_size) // (grid_rows - 1)
+                grid_w = grid_cols * square_size + (grid_cols - 1) * padding_x
+                grid_h = grid_rows * square_size + (grid_rows - 1) * padding_y
+
+                for eye_idx, preview_eye in enumerate([left_preview, right_preview]):
+                    sign = -1 if eye_idx == 0 else 1
+                    cx = int(center_x + sign * display_horizontal_offset / 2.0)
+                    start_x = cx - grid_w // 2
+                    start_y = curr_h // 2 - grid_h // 2
+                    for r in range(grid_rows):
+                        for c in range(grid_cols):
+                            x = start_x + c * (square_size + padding_x)
+                            y = start_y + r * (square_size + padding_y)
+                            color = grid_colors[r * grid_cols + c]
+                            cv2.rectangle(preview_eye, (x, y), (x + square_size, y + square_size), color, -1)
+                for eye_idx, preview_eye in enumerate([left_preview, right_preview]):
+                    sign = -1 if eye_idx == 0 else 1
+                    cx = int(center_x + sign * display_horizontal_offset / 2.0)
+                    cy = curr_h // 2
+                    radius = int(curr_h * 0.4)
+                    cv2.circle(preview_eye, (cx, cy), radius, (255, 255, 255), 4)
+
+            info = f"display_offset:{display_horizontal_offset}  grid:{'on' if show_grid else 'off'}"
+            controls = "[/]:display_offset  g:grid  f:fullscreen  v:PSM  q:quit"
+
+            if split_mode:
+                cv2.putText(left_preview, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(left_preview, controls, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.imshow(left_window_name, left_preview)
+                cv2.imshow(right_window_name, right_preview)
+            else:
+                preview = np.hstack([left_preview, right_preview])
+                cv2.putText(preview, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(preview, controls, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                display = preview
+                if preview_fullscreen:
+                    try:
+                        _, _, win_w, win_h = cv2.getWindowImageRect(window_name)
+                        if win_w > 0 and win_h > 0:
+                            display = cv2.resize(preview, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
+                    except cv2.error:
+                        pass
+                cv2.imshow(window_name, display)
+
+            cv2.waitKey(1)
+            key = term.get_key()
+
+            if key == KEY_QUIT:
+                break
+            elif key == KEY_FULLSCREEN:
+                preview_fullscreen = not preview_fullscreen
+                mode = cv2.WINDOW_FULLSCREEN if preview_fullscreen else cv2.WINDOW_NORMAL
+                aspect = cv2.WINDOW_FREERATIO if preview_fullscreen else cv2.WINDOW_KEEPRATIO
+                if split_mode:
+                    for wn in [left_window_name, right_window_name]:
+                        cv2.setWindowProperty(wn, cv2.WND_PROP_FULLSCREEN, mode)
+                        cv2.setWindowProperty(wn, cv2.WND_PROP_ASPECT_RATIO, aspect)
+                else:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, mode)
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_ASPECT_RATIO, aspect)
+            elif key == KEY_LINE_LEFT:
+                display_horizontal_offset -= 2
+            elif key == KEY_LINE_RIGHT:
+                display_horizontal_offset += 2
+            elif key == KEY_LINE_TOGGLE:
+                show_grid = not show_grid
+            elif key == KEY_PSM_OSCILLATE:
+                if arm:
+                    if not oscillating:
+                        with oscillation_lock:
+                            initial_jp_val, _ = arm.setpoint_jp()
+                            initial_jp = np.array(initial_jp_val)
+                            oscillation_start_time = time.time()
+                            oscillating = True
+                        print(f"Starting oscillation on {psm_name} joint 4...")
+                    else:
+                        with oscillation_lock:
+                            oscillating = False
+                        arm.move_jp(initial_jp)
+                        print(f"Stopped oscillation on {psm_name}.")
+                else:
+                    print("Error: No PSM specified. Use -p/--psm.")
+
+    left_cap.release()
+    right_cap.release()
+    cv2.destroyAllWindows()
+
+    return int(display_horizontal_offset)
+
+
+def main():
+    args = parse_args()
+    path = Path(args.config)
+    if not path.exists():
+        print(f"Error: config file does not exist: {path}")
+        return 1
+
+    with path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    try:
+        split_mode = args.split or "glimages" in config.get("sinks", [])
+        display_horizontal_offset = interactive_display_tune(
+            config, split_mode=split_mode, psm_name=args.psm
+        )
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    while True:
+        decision = input(f"Save display_horizontal_offset_px={display_horizontal_offset} to {path}? [y/N]: ").strip().lower()
+        if decision in ("y", "yes"):
+            break
+        if decision in ("", "n", "no"):
+            print("Changes discarded.")
+            return 0
+        print("Please answer with y/yes or n/no.")
+
+    config["display_horizontal_offset_px"] = display_horizontal_offset
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(config, indent=2) + "\n")
+
+    print(f"Wrote {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
