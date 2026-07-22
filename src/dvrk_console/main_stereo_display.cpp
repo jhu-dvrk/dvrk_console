@@ -36,7 +36,6 @@
 #include <dvrk_data/config.hpp>
 #include <dvrk_data/dvrk_gst_socket.hpp>
 #include "display_output_panel.hpp"
-#include <dvrk_data/gst_utils.hpp>
 #include "overlay.hpp"
 #include <dvrk_data/cpu_timestamp_meta.hpp>
 #include <dvrk_data/stereo_common.hpp>
@@ -89,8 +88,6 @@ static GstPadProbeReturn sink_fps_probe_cb(GstPad *pad, GstPadProbeInfo *info, g
 struct CommandLineOptions {
   std::string config_file;
   bool show_grid = false;
-  bool dump_dot = false;
-  GstDebugGraphDetails dot_flags = GST_DEBUG_GRAPH_SHOW_ALL;
 };
 
 static Glib::RefPtr<Gtk::Application> g_app;
@@ -104,10 +101,9 @@ struct FrameTimestampState {
 
 void print_usage(const char *executable) {
   std::cerr << "Usage: " << executable
-            << " -c <config.json> [--grid] [-g <0|1|2|3>]" << std::endl;
+            << " -c <config.json> [--grid]" << std::endl;
   std::cerr << "  --grid   Display calibration grid overlay for display alignment"
             << std::endl;
-  dc::print_dot_usage();
 }
 
 bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
@@ -132,10 +128,6 @@ bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
 
     if (arg == "--grid") {
       options.show_grid = true;
-      continue;
-    }
-
-    if (dc::parse_dot_arguments(i, argc, argv, options.dump_dot, options.dot_flags)) {
       continue;
     }
 
@@ -1596,10 +1588,6 @@ int main(int argc, char *argv[]) {
 
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
   RCLCPP_INFO(node->get_logger(), "Stereo display pipeline started");
-
-  if (options.dump_dot) {
-    dc::dump_dot(pipeline, "stereo_pipeline.dot", options.dot_flags);
-  }
 
   window.show();
   g_app->run(window);
