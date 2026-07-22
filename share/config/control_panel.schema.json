@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dvrk_console:control_panel@1.0.0",
+  "title": "dVRK control panel configuration",
+  "description": "Configuration consumed by dvrk_console control_panel. The executable currently identifies this format by its fields rather than a type property.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["video_source"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "default": "dvrk_display",
+      "description": "Settings key used to persist window and appearance preferences."
+    },
+    "console": {
+      "type": "string",
+      "minLength": 1,
+      "default": "console",
+      "description": "dVRK console ROS namespace."
+    },
+    "video_source": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Socket in short-name, role:name, or @dvrk_gst:role:name form."
+      },
+      "uniqueItems": true,
+      "description": "Preferred video sockets. Other active @dvrk_gst sockets are discovered at startup."
+    }
+  }
+}

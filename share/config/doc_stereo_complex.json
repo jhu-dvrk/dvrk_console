@@ -2,28 +2,20 @@
   "type": "dvrk_console:stereo_display@1.0.0",
   "name": "stereo_complex",
   "dvrk_console_namespace": "console",
-  "sinks": ["glimage", "glimages"],
   "overlay_alpha": 0.5,
+  "stereo": {
+    "stream": "videotestsrc pattern=smpte is-live=true ! video/x-raw,width=1280,height=480,framerate=30/1",
+    "eye_size": {"width": 640, "height": 480}
+  },
+  "sinks": ["glimage", "glimages"],
+  "unixfdsinks": [
+    {"socket": "stereo"},
+    {"socket": "overlay"}
+  ],
   "extra_streams": {
     "monos": [
-      "videotestsrc pattern=snow ! video/x-raw,width=320,height=240,framerate=10/1"
+      "videotestsrc pattern=snow is-live=true ! video/x-raw,width=320,height=240,framerate=10/1"
     ],
     "scale": 0.3
-  },
-  "camera": {
-    "size": {
-      "width": 640,
-      "height": 480
-    },
-    "left": {
-      "stream": "videotestsrc pattern=white ! video/x-raw,width=640,height=480,framerate=30/1"
-    },
-    "right": {
-      "stream": "videotestsrc pattern=black ! video/x-raw,width=640,height=480,framerate=30/1"
-    },
-    "crop": {
-      "width": 640,
-      "height": 480
-    }
   }
 }

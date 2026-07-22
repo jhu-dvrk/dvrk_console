@@ -1,136 +1,91 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "dvrk_console:stereo_display@1.0.0",
-  "title": "dvrk_console stereo configuration",
-  "description": "Configuration file for the dvrk_console stereo_display executable.",
+  "title": "dVRK stereo display configuration",
+  "description": "Configuration consumed by the dvrk_console stereo_display executable.",
   "type": "object",
-  "required": ["type"],
   "additionalProperties": false,
+  "required": ["type"],
   "properties": {
     "type": {
-      "type": "string",
       "const": "dvrk_console:stereo_display@1.0.0"
     },
     "name": {
       "type": "string",
+      "minLength": 1,
       "default": "dvrk_display"
     },
     "dvrk_console_namespace": {
       "type": "string",
-      "default": "console"
-    },
-    "ros_image_publishers": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "enum": ["left", "right", "stereo"]
-      },
-      "uniqueItems": true,
-      "default": []
+      "minLength": 1,
+      "default": "console",
+      "description": "ROS namespace used for console, teleoperation, and arm status subscriptions."
     },
     "overlay_alpha": {
       "type": "number",
-      "default": 0.7,
       "minimum": 0.0,
-      "maximum": 1.0
+      "maximum": 1.0,
+      "default": 0.7
     },
     "preserve_size": {
       "type": "boolean",
-      "default": true
+      "default": true,
+      "description": "Retained for compatibility with the shared stereo configuration parser."
     },
     "display_horizontal_offset_px": {
       "type": "integer",
-      "default": 0
+      "default": 0,
+      "description": "Per-eye horizontal display calibration offset written by stereo_display_calibration."
     },
     "stereo": {
       "type": "object",
-      "required": ["stream"],
       "additionalProperties": false,
       "properties": {
+        "socket": {
+          "$ref": "#/$defs/socketName",
+          "description": "Aligned side-by-side stereo socket. Overrides stream when both are present."
+        },
         "stream": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "GStreamer source fragment producing a side-by-side stereo frame."
         },
         "eye_size": {
-          "$ref": "#/definitions/size"
+          "$ref": "#/$defs/size",
+          "description": "Width and height of one eye in the side-by-side stream."
         },
         "size": {
-          "$ref": "#/definitions/size"
+          "$ref": "#/$defs/size",
+          "description": "Legacy total stereo size. The parser divides width by two to obtain eye width."
         }
-      }
-    },
-    "camera": {
-      "type": "object",
-      "required": [],
-      "additionalProperties": false,
-      "properties": {
-        "size": {
-          "$ref": "#/definitions/size"
-        },
-        "left": {
-          "$ref": "#/definitions/cameraStream"
-        },
-        "right": {
-          "$ref": "#/definitions/cameraStream"
-        },
-        "crop": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "width": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "height": {
-              "type": "integer",
-              "minimum": 1
-            }
-          }
-        },
-        "alignment": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "horizontal_shift_px": {
-              "type": "integer",
-              "default": 0
-            },
-            "vertical_shift_px": {
-              "type": "integer",
-              "default": 0
-            }
-          }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            { "required": ["eye_size"] },
+            { "required": ["size"] }
+          ]
         }
-      }
+      ]
     },
     "sinks": {
       "type": "array",
       "items": {
-        "type": "string",
         "enum": ["glimage", "glimages"]
       },
       "default": []
     },
+    "unixfdsources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/socketEntry" },
+      "minItems": 1,
+      "description": "Legacy/explicit alternative to stereo.socket. The first entry is used as the aligned stereo input."
+    },
     "unixfdsinks": {
       "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["stream"],
-        "additionalProperties": false,
-        "properties": {
-          "stream": {
-            "type": "string",
-            "enum": ["stereo", "overlay"]
-          },
-          "name": {
-            "type": "string"
-          },
-          "socket_path": {
-            "type": "string"
-          }
-        }
-      },
-      "default": []
+      "items": { "$ref": "#/$defs/socketEntry" },
+      "default": [],
+      "description": "Local outputs. Only sockets whose short name is stereo or overlay are connected."
     },
     "extra_streams": {
       "type": "object",
@@ -138,24 +93,18 @@
       "properties": {
         "monos": {
           "type": "array",
-          "items": {
-            "type": "string"
-          },
+          "items": { "type": "string", "minLength": 1 },
           "default": []
         },
         "stereos": {
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["left", "right"],
             "additionalProperties": false,
+            "required": ["left", "right"],
             "properties": {
-              "left": {
-                "type": "string"
-              },
-              "right": {
-                "type": "string"
-              }
+              "left": { "type": "string", "minLength": 1 },
+              "right": { "type": "string", "minLength": 1 }
             }
           },
           "default": []
@@ -172,79 +121,53 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": false
-        },
-        "left_socket": {
-          "type": "string"
-        },
-        "right_socket": {
-          "type": "string"
-        },
+        "enabled": { "type": "boolean", "default": true },
+        "left": { "$ref": "#/$defs/socketName" },
+        "right": { "$ref": "#/$defs/socketName" },
         "color_key": {
           "type": "array",
           "minItems": 3,
           "maxItems": 3,
-          "items": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 255
-          }
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 }
         }
       }
     }
   },
-  "definitions": {
+  "required": ["stereo"],
+  "anyOf": [
+    {
+      "properties": {
+        "stereo": { "required": ["socket"] }
+      }
+    },
+    {
+      "properties": {
+        "stereo": { "required": ["stream"] }
+      }
+    },
+    { "required": ["unixfdsources"] }
+  ],
+  "$defs": {
     "size": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["width", "height"],
-      "additionalProperties": false,
       "properties": {
-        "width": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "height": {
-          "type": "integer",
-          "minimum": 1
-        }
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
       }
     },
-    "cameraStream": {
-      "type": "object",
-      "required": ["stream"],
-      "additionalProperties": false,
-      "properties": {
-        "stream": {
-          "type": "string",
-          "minLength": 1
-        },
-        "color": {
-          "$ref": "#/definitions/colorAdjustment"
-        }
-      }
+    "socketName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Socket in short-name, role:name, or @dvrk_gst:role:name form."
     },
-    "colorAdjustment": {
+    "socketEntry": {
       "type": "object",
       "additionalProperties": false,
+      "required": ["socket"],
       "properties": {
-        "brightness": {
-          "type": "number",
-          "default": 0.0
-        },
-        "contrast": {
-          "type": "number",
-          "default": 1.0
-        },
-        "saturation": {
-          "type": "number",
-          "default": 1.0
-        },
-        "hue": {
-          "type": "number",
-          "default": 0.0
-        }
+        "socket": { "$ref": "#/$defs/socketName" }
       }
     }
   }
