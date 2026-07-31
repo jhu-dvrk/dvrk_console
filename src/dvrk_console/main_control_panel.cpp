@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <utility>
 
 #include <fstream>
 #include <dvrk_data/config.hpp>
@@ -298,9 +299,7 @@ protected:
     }
 
     bool on_delete_event(GdkEventAny* /* any_event */) override {
-        save_persisted_display_settings();
-        save_persisted_user_settings();
-        hide();
+        quit_application();
         return true;
     }
 
@@ -1213,6 +1212,7 @@ private:
                 },
                 [this]() {
                     m_window_monitor_index = m_monitor_manager->get_monitor_index();
+                    apply_touchscreen_settings_for_monitor(m_window_monitor_index, false);
                 }
             );
         }
@@ -1228,15 +1228,23 @@ private:
         });
         m_wrench_menu.append(*fullscreen_item);
 
-        // 4. Add "Dark Mode" toggle item
+        // 4. Add "Touchscreen" submenu
+        auto* touchscreen_item = create_menu_item("Touchscreen");
+        auto* touchscreen_menu = Gtk::manage(new Gtk::Menu());
+        append_touchscreen_items(*touchscreen_menu);
+        touchscreen_item->set_submenu(*touchscreen_menu);
+        apply_menu_item_text_color(*touchscreen_item);
+        m_wrench_menu.append(*touchscreen_item);
+
+        // 5. Add "Dark Mode" toggle item
         auto* dark_mode_item = create_menu_item(m_dark_mode ? "Light Mode" : "Dark Mode");
         dark_mode_item->signal_activate().connect(sigc::mem_fun(*this, &ControlPanelWindow::toggle_dark_mode));
         m_wrench_menu.append(*dark_mode_item);
 
-        // 5. Add "Quit" item
+        // 6. Add "Quit" item
         auto* quit_item = create_menu_item("Quit");
         quit_item->signal_activate().connect([this]() {
-            close();
+            quit_application();
         });
         m_wrench_menu.append(*quit_item);
 
@@ -1300,6 +1308,7 @@ private:
                 m_persisted_video_path =
                     key_file.get_string("video", "source");
             }
+            load_persisted_touchscreen_settings(key_file);
         } catch (const Glib::Error& error) {
             std::cerr << "Warning: unable to load user settings from '"
                       << path << "': " << error.what() << std::endl;
@@ -1325,6 +1334,13 @@ private:
                 key_file.set_string("video", "source", m_current_video_path);
                 m_persisted_video_path = m_current_video_path;
             }
+            for (const auto& [monitor_index, enabled] : m_touchscreen_by_monitor) {
+                if (monitor_index >= 0) {
+                    key_file.set_boolean("touchscreen",
+                                         touchscreen_monitor_key(monitor_index),
+                                         enabled);
+                }
+            }
             Glib::file_set_contents(path, key_file.to_data());
         } catch (const Glib::Error& error) {
             std::cerr << "Warning: unable to save user settings: "
@@ -1341,12 +1357,17 @@ private:
             m_monitor_manager->set_fullscreen(m_window_fullscreen);
             m_monitor_manager->apply_display_settings(0);
         }
+        apply_touchscreen_settings_for_monitor(m_window_monitor_index, false);
     }
 
     bool poll_window_monitor() {
         if (m_monitor_manager) {
+            const int previous_monitor_index = m_window_monitor_index;
             m_monitor_manager->poll_window_monitor("window");
             m_window_monitor_index = m_monitor_manager->get_monitor_index();
+            if (m_window_monitor_index != previous_monitor_index) {
+                apply_touchscreen_settings_for_current_monitor(false);
+            }
         }
         return true;
     }
@@ -1356,6 +1377,197 @@ private:
             return m_monitor_manager->get_current_monitor_index();
         }
         return -1;
+    }
+
+    void append_touchscreen_items(Gtk::Menu& menu) {
+        const int monitor_index = touchscreen_menu_monitor_index();
+        const bool is_touchscreen = is_touchscreen_monitor(monitor_index);
+
+        Gtk::RadioMenuItem::Group group;
+        auto* is_touchscreen_item = Gtk::manage(new Gtk::RadioMenuItem(group, "Is touchscreen"));
+        auto* not_touchscreen_item = Gtk::manage(new Gtk::RadioMenuItem(group, "Not a touchscreen"));
+
+        apply_menu_item_text_color(*is_touchscreen_item);
+        apply_menu_item_text_color(*not_touchscreen_item);
+
+        is_touchscreen_item->set_active(is_touchscreen);
+        not_touchscreen_item->set_active(!is_touchscreen);
+
+        is_touchscreen_item->signal_toggled().connect([this, is_touchscreen_item, monitor_index]() {
+            if (is_touchscreen_item->get_active()) {
+                set_touchscreen_monitor(monitor_index, true);
+            }
+        });
+        not_touchscreen_item->signal_toggled().connect([this, not_touchscreen_item, monitor_index]() {
+            if (not_touchscreen_item->get_active()) {
+                set_touchscreen_monitor(monitor_index, false);
+            }
+        });
+
+        menu.append(*is_touchscreen_item);
+        menu.append(*not_touchscreen_item);
+    }
+
+    int touchscreen_menu_monitor_index() {
+        const int current_monitor_index = monitor_index_for_window();
+        if (current_monitor_index >= 0) {
+            m_window_monitor_index = current_monitor_index;
+            return current_monitor_index;
+        }
+        return m_window_monitor_index;
+    }
+
+    static std::string touchscreen_monitor_key(int monitor_index) {
+        return "monitor_" + std::to_string(monitor_index);
+    }
+
+    void load_persisted_touchscreen_settings(Glib::KeyFile& key_file) {
+        m_touchscreen_by_monitor.clear();
+        if (!key_file.has_group("touchscreen")) {
+            return;
+        }
+
+        constexpr int max_persisted_monitors = 32;
+        for (int i = 0; i < max_persisted_monitors; ++i) {
+            const std::string key = touchscreen_monitor_key(i);
+            if (key_file.has_key("touchscreen", key)) {
+                m_touchscreen_by_monitor[i] = key_file.get_boolean("touchscreen", key);
+            }
+        }
+    }
+
+    bool is_touchscreen_monitor(int monitor_index) const {
+        const auto found = m_touchscreen_by_monitor.find(monitor_index);
+        return found != m_touchscreen_by_monitor.end() && found->second;
+    }
+
+    void set_touchscreen_monitor(int monitor_index, bool enabled) {
+        if (monitor_index < 0) {
+            std::cerr << "Warning: unable to set touchscreen state without a current monitor" << std::endl;
+            return;
+        }
+
+        m_touchscreen_by_monitor[monitor_index] = enabled;
+        save_persisted_user_settings();
+
+        if (enabled) {
+            apply_touchscreen_settings_for_monitor(monitor_index, true);
+        } else {
+            m_last_touchscreen_apply_monitor_index = -1;
+        }
+    }
+
+    void quit_application() {
+        save_persisted_display_settings();
+        save_persisted_user_settings();
+
+        auto application = get_application();
+        if (application) {
+            application->quit();
+        } else {
+            hide();
+        }
+    }
+
+    void apply_touchscreen_settings_for_current_monitor(bool force) {
+        int monitor_index = m_window_monitor_index;
+        const int current_monitor_index = monitor_index_for_window();
+        if (current_monitor_index >= 0) {
+            monitor_index = current_monitor_index;
+            m_window_monitor_index = current_monitor_index;
+        }
+        apply_touchscreen_settings_for_monitor(monitor_index, force);
+    }
+
+    void apply_touchscreen_settings_for_monitor(int monitor_index, bool force) {
+        if (monitor_index < 0 || !is_touchscreen_monitor(monitor_index)) {
+            return;
+        }
+        if (!force && m_last_touchscreen_apply_monitor_index == monitor_index) {
+            return;
+        }
+
+        const std::string geometry = monitor_geometry_string(monitor_index);
+        if (geometry.empty()) {
+            std::cerr << "Warning: unable to configure touchscreen for monitor "
+                      << monitor_index << ": monitor geometry unavailable" << std::endl;
+            return;
+        }
+
+        const std::string command =
+            "output=$(xrandr --query 2>/dev/null | grep ' connected' | grep " +
+            shell_quote(geometry) +
+            " | head -n 1 | cut -d' ' -f1); "
+            "if [ -z \"$output\" ]; then echo \"dvrk_console: no xrandr output found for monitor geometry " +
+            geometry +
+            "\" >&2; exit 1; fi; "
+            "device=$(xinput list 2>/dev/null "
+            "| grep -iE 'slave[[:space:]]+pointer' "
+            "| grep -viE 'touchpad' "
+            "| grep -iE 'touchscreen|touch screen|mtouch|multi.?touch|touch.*screen|touch.*controller|touch controller|touch' "
+            "| sed -n 's/.*id=\\([0-9][0-9]*\\).*/\\1/p' "
+            "| head -n 1); "
+            "if [ -z \"$device\" ]; then echo \"dvrk_console: no touchscreen pointer input device found\" >&2; exit 1; fi; "
+            "echo \"dvrk_console: mapping touchscreen input id $device to output $output (" +
+            geometry +
+            ")\" >&2; "
+            "xinput map-to-output \"$device\" \"$output\"";
+
+        std::cerr << "Configuring touchscreen for monitor " << monitor_index
+                  << " (" << geometry << ")" << std::endl;
+        if (run_shell_command(command, "configure touchscreen")) {
+            m_last_touchscreen_apply_monitor_index = monitor_index;
+        }
+    }
+
+    std::string monitor_geometry_string(int monitor_index) const {
+        auto display = Gdk::Display::get_default();
+        if (!display || monitor_index < 0 || monitor_index >= display->get_n_monitors()) {
+            return "";
+        }
+
+        auto monitor = display->get_monitor(monitor_index);
+        if (!monitor) {
+            return "";
+        }
+
+        Gdk::Rectangle geometry;
+        monitor->get_geometry(geometry);
+        std::ostringstream ss;
+        ss << geometry.get_width() << "x" << geometry.get_height();
+        append_xrandr_offset(ss, geometry.get_x());
+        append_xrandr_offset(ss, geometry.get_y());
+        return ss.str();
+    }
+
+    static void append_xrandr_offset(std::ostringstream& ss, int offset) {
+        if (offset >= 0) {
+            ss << "+";
+        }
+        ss << offset;
+    }
+
+    static std::string shell_quote(const std::string& value) {
+        std::string quoted = "'";
+        for (char ch : value) {
+            if (ch == '\'') {
+                quoted += "'\\''";
+            } else {
+                quoted += ch;
+            }
+        }
+        quoted += "'";
+        return quoted;
+    }
+
+    static bool run_shell_command(const std::string& command, const std::string& description) {
+        const int result = std::system(command.c_str());
+        if (result != 0) {
+            std::cerr << "Warning: unable to " << description
+                      << " (command exited with status " << result << ")" << std::endl;
+            return false;
+        }
+        return true;
     }
 
     void toggle_dark_mode() {
@@ -1620,6 +1832,8 @@ private:
     int m_window_monitor_index = 0;
     bool m_window_fullscreen = false;
     bool m_have_persisted_display_settings = false;
+    std::unordered_map<int, bool> m_touchscreen_by_monitor;
+    int m_last_touchscreen_apply_monitor_index = -1;
     std::unique_ptr<sv::WindowMonitorManager> m_monitor_manager;
 
     // Colors
