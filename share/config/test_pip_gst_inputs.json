@@ -1,0 +1,20 @@
+{
+  "type": "dvrk_console:stereo_display@1.0.0",
+  "name": "test_pip_gst_inputs",
+  "dvrk_console_namespace": "console",
+  "gst_input": "videotestsrc pattern=snow is-live=true ! video/x-raw,width=1280,height=480,framerate=30/1",
+  "eye_size": {"width": 640, "height": 480},
+  "sinks": ["glimage"],
+  "pip_gst_inputs": {
+    "monos": [
+      {"gst_input": "videotestsrc pattern=ball is-live=true ! video/x-raw,width=320,height=240,framerate=30/1"}
+    ],
+    "stereos": [
+      {
+        "left": {"gst_input": "videotestsrc pattern=smpte is-live=true ! video/x-raw,width=320,height=240,framerate=30/1"},
+        "right": {"gst_input": "videotestsrc pattern=colors is-live=true ! video/x-raw,width=320,height=240,framerate=30/1"}
+      }
+    ],
+    "scale": 0.3
+  }
+}

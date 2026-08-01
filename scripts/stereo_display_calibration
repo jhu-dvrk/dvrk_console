@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive calibration tool for the dvrk_console stereo display offset.
 
-This tool previews the live stereo feed from a ``@dvrk_gst`` abstract socket
+This tool previews the live stereo feed from a ``@dvrk:`` abstract socket
 (produced by ``stereo_alignment``) and lets the operator interactively adjust
 the ``display_horizontal_offset_px`` value that controls how far apart the two
 eye windows are shifted on the surgeon's console display.
@@ -11,13 +11,11 @@ camera crop, alignment shifts, and color correction.  Then run this tool to
 calibrate the display offset that positions the stereo image at the surgeon's
 working depth.
 
-The config must contain a ``stereo.socket`` field pointing to the
+The config must contain a root ``gst_input`` field pointing to the
 ``stereo_alignment`` output socket, e.g.::
 
-    "stereo": {
-        "socket": "stereo_alignment:stereo",
-        "eye_size": {"width": 1920, "height": 1080}
-    }
+    "gst_input": "@dvrk:stereo_alignment:stereo",
+    "eye_size": {"width": 1920, "height": 1080}
 """
 
 import argparse
@@ -94,7 +92,7 @@ def open_capture(source_snippet: str):
             "Make sure stereo_source and stereo_alignment are running:\n"
             "  ros2 run dvrk_data stereo_source -c <stereo_source.json>\n"
             "  ros2 run dvrk_data stereo_alignment -c <stereo_alignment.json>\n"
-            "\nTo list currently active @dvrk_gst sockets:\n"
+            "\nTo list currently active @dvrk sockets:\n"
             "  ros2 run dvrk_data gscam_socket"
         )
         raise RuntimeError(msg)
@@ -105,7 +103,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Interactive dvrk_console stereo display offset calibration tool. "
-            "Reads the pre-aligned stereo stream from a stereo.socket and lets "
+            "Reads the pre-aligned stereo stream from root gst_input and lets "
             "the operator tune display_horizontal_offset_px interactively."
         )
     )
@@ -115,22 +113,21 @@ def parse_args():
 
 
 def interactive_display_tune(config, split_mode=False):
-    stereo_cfg = config.get("stereo", {})
-    stereo_socket_field = stereo_cfg.get("socket", "").strip()
-    if not stereo_socket_field:
+    gst_input = config.get("gst_input", "").strip()
+    if not gst_input:
         raise RuntimeError(
-            "stereo.socket is required but not set in the config.\n"
-            "Add a 'stereo' section with a 'socket' field, e.g.:\n"
-            '  "stereo": {"socket": "stereo_alignment:stereo", '
+            "gst_input is required but not set in the config.\n"
+            "Add a root 'gst_input' field, e.g.:\n"
+            '  "gst_input": "@dvrk:stereo_alignment:stereo", '
             '"eye_size": {"width": 1920, "height": 1080}}'
         )
 
-    abstract_name = dvrk_gst.resolve(stereo_socket_field, dvrk_gst.ROLE_STEREO_ALIGNMENT)
-    eye_size = stereo_cfg.get("eye_size", config.get("camera", {}).get("size", {}))
+    eye_size = config.get("eye_size", config.get("camera", {}).get("size", {}))
     eye_w = int(eye_size.get("width", 0))
     eye_h = int(eye_size.get("height", 0))
-    stereo_snippet = dvrk_gst.build_src(abstract_name, eye_w * 2, eye_h)
-    print(f"Using stereo socket: {abstract_name}")
+    stereo_snippet = dvrk_gst.build_input(
+        gst_input, dvrk_gst.ROLE_STEREO_ALIGNMENT, eye_w * 2, eye_h)
+    print(f"Using stereo input: {gst_input}")
     cap = open_capture(stereo_snippet)
 
     # Probe the first frame to confirm dimensions

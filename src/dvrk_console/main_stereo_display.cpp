@@ -190,22 +190,6 @@ std::string get_unixfd_upload_chain() {
   return "gldownload ! videoconvert ! video/x-raw,format=I420";
 }
 
-/// Warn if any declared unixfd source socket is not yet active.
-void warn_missing_unixfd_source_sockets(const sv::AppConfig &cfg,
-                                        const rclcpp::Logger &logger) {
-  for (const auto &src : cfg.unixfd_sources) {
-    const std::string abstract_name =
-        dvrk_gst::resolve(src.socket, dvrk_gst::ROLE_STEREO_ALIGNMENT);
-    if (!dvrk_gst::check_socket(abstract_name, std::cerr)) {
-      RCLCPP_WARN(
-          logger,
-          "unixfd source socket not yet active: %s. "
-          "Start the producer first; otherwise the display sinks can remain idle.",
-          abstract_name.c_str());
-    }
-  }
-}
-
 GstPadProbeReturn frame_timestamp_probe_cb(GstPad *pad, GstPadProbeInfo *info,
                                            gpointer user_data) {
   (void)pad;
@@ -260,15 +244,9 @@ GstPadProbeReturn frame_timestamp_probe_cb(GstPad *pad, GstPadProbeInfo *info,
           timestamps.right_source_ts = state->right_source_ts;
         }
 
-        if (element_name.rfind("__stereo_unixfd_ts_q", 0) == 0 ||
-            element_name == "__stereo_overlay_input_ts_q__") {
+        if (element_name == "__stereo_output_q__") {
           timestamps.stereo_output_ts = now;
           state->stereo_output_ts = now;
-        } else if (element_name.rfind("__overlay_unixfd_ts_q", 0) == 0) {
-          if (timestamps.stereo_output_ts == 0) {
-            timestamps.stereo_output_ts = state->stereo_output_ts;
-          }
-          timestamps.overlay_output_ts = now;
         }
       }
     }
@@ -334,25 +312,8 @@ void attach_ar_timestamp_probes(GstElement *pipeline) {
 void attach_timestamp_probes(GstElement *pipeline, const sv::AppConfig &cfg,
                              FrameTimestampState *timestamp_state) {
   add_timestamp_probe(pipeline, "__stereo_src_q__", timestamp_state);
-  add_timestamp_probe(pipeline, "__stereo_overlay_input_ts_q__", timestamp_state);
-
-  int stereo_index = 0;
-  int overlay_index = 0;
-  for (const auto &sink : cfg.unixfd_sinks) {
-    const std::string abstract_name = dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
-    const std::string short_name = abstract_name.substr(abstract_name.rfind(':') + 1);
-    if (short_name == "stereo") {
-      add_timestamp_probe(
-          pipeline,
-          "__stereo_unixfd_ts_q" + std::to_string(stereo_index++) + "__",
-          timestamp_state);
-    } else if (short_name == "overlay") {
-      add_timestamp_probe(
-          pipeline,
-          "__overlay_unixfd_ts_q" + std::to_string(overlay_index++) + "__",
-          timestamp_state);
-    }
-  }
+  if (!cfg.stereo.gst_output.empty())
+    add_timestamp_probe(pipeline, "__stereo_output_q__", timestamp_state);
 }
 
 gboolean on_sigint(gpointer) {
@@ -388,14 +349,14 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
   const bool has_glimages = std::find(stereo.sinks.begin(), stereo.sinks.end(),
                                       "glimages") != stereo.sinks.end();
 
-  const auto &es = stereo.extra_streams;
+  const auto &es = stereo.pip_gst_inputs;
   const int n_mono = static_cast<int>(es.monos.size());
   const int n_stereo = static_cast<int>(es.stereos.size());
   const int n_extra_streams = n_mono + n_stereo;
   const bool has_extra = n_extra_streams > 0 && es.scale > 0.01;
   const bool has_ar = stereo.ar.enabled &&
-                      (!stereo.ar.left.empty() ||
-                       !stereo.ar.right.empty());
+                      (!stereo.ar.left.gst_input.empty() ||
+                       !stereo.ar.right.gst_input.empty());
   const bool split_stereo_for_presentation = has_extra || has_ar;
 
   int stereo_h = eye_h;
@@ -469,7 +430,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
 
   if (split_stereo_for_presentation) {
     input_chain =
-        stereo.stereo.source +
+        stereo.stereo.gst_input +
         " ! queue name=__stereo_src_q__ max-size-buffers=8 "
         "max-size-time=0 max-size-bytes=0 leaky=downstream" +
         normalized_stereo_caps + " ! tee name=__clean_stereo__ ";
@@ -480,7 +441,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
         " top=0 bottom=0 ! video/x-raw,width=" + std::to_string(eye_w) +
         ",height=" + std::to_string(eye_h) + " ! glupload";
 
-    if (stereo.ar.enabled && !stereo.ar.left.empty()) {
+    if (stereo.ar.enabled && !stereo.ar.left.gst_input.empty()) {
       left_chain += " ! left_ar_mix.sink_0 ";
       left_chain +=
           "glvideomixer name=left_ar_mix background=1 force-live=true"
@@ -500,8 +461,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
                     " target-b=" + std::to_string(stereo.ar.color_key_b);
       }
       left_chain +=
-          "unixfdsrc name=left_ar_src socket-path=" + dvrk_gst::to_gst_path(stereo.ar.left) +
-          " socket-type=abstract do-timestamp=true"
+          stereo.ar.left.gst_input + " ! identity name=left_ar_src"
           " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
           " leaky=downstream"
           " ! videoconvert ! video/x-raw,format=RGBA" +
@@ -521,7 +481,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
         std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
         " ! glupload";
 
-    if (stereo.ar.enabled && !stereo.ar.right.empty()) {
+    if (stereo.ar.enabled && !stereo.ar.right.gst_input.empty()) {
       right_chain += " ! right_ar_mix.sink_0 ";
       right_chain +=
           "glvideomixer name=right_ar_mix background=1 force-live=true"
@@ -541,8 +501,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
                     " target-b=" + std::to_string(stereo.ar.color_key_b);
       }
       right_chain +=
-          "unixfdsrc name=right_ar_src socket-path=" + dvrk_gst::to_gst_path(stereo.ar.right) +
-          " socket-type=abstract do-timestamp=true"
+          stereo.ar.right.gst_input + " ! identity name=right_ar_src"
           " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
           " leaky=downstream"
           " ! videoconvert ! video/x-raw,format=RGBA" +
@@ -567,32 +526,17 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
         ",height=" + std::to_string(eye_h);
   } else {
     presentation_chain =
-        stereo.stereo.source +
+        stereo.stereo.gst_input +
         " ! queue name=__stereo_src_q__ max-size-buffers=8 "
         "max-size-time=0 max-size-bytes=0 leaky=downstream" +
         normalized_stereo_caps + " ! glupload ! glcolorconvert";
   }
 
-  std::vector<sv::UnixfdSinkConfig> stereo_unixfd_sinks;
-  std::vector<sv::UnixfdSinkConfig> overlay_unixfd_sinks;
-  for (const auto &sink : stereo.unixfd_sinks) {
-    const std::string resolved =
-        dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
-    // Classify by the short name (last ':' component).
-    const auto colon = resolved.rfind(':');
-    const std::string short_name =
-        (colon != std::string::npos) ? resolved.substr(colon + 1) : resolved;
-    if (short_name == "stereo") {
-      stereo_unixfd_sinks.push_back(sink);
-    } else if (short_name == "overlay") {
-      overlay_unixfd_sinks.push_back(sink);
-    }
-  }
+  const bool has_stereo_socket_output = !stereo.stereo.gst_output.empty();
 
   const bool has_display_output = has_glimage || has_glimages;
   const int stereo_branches = (has_display_output ? 1 : 0) +
-                              stereo_unixfd_sinks.size() +
-                              (overlay_unixfd_sinks.empty() ? 0 : 1);
+                              (has_stereo_socket_output ? 1 : 0);
 
   std::string output_chain = presentation_chain;
   if (stereo_branches > 0) {
@@ -734,10 +678,9 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
       }
     }
 
-    int stereo_unixfd_index = 0;
-    for (const auto &sink : stereo_unixfd_sinks) {
+    if (has_stereo_socket_output) {
       const std::string abstract_name =
-          dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
+          dvrk_gst::resolve(stereo.stereo.gst_output);
       if (stereo_branches > 1) {
         output_chain +=
             " __stereo_out__. ! queue max-size-buffers=2 max-size-time=0 "
@@ -748,49 +691,11 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
             "leaky=downstream ! ";
       }
       output_chain +=
-          get_unixfd_upload_chain() + " ! queue name=__stereo_unixfd_ts_q" +
-          std::to_string(stereo_unixfd_index++) +
-          "__ max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
+          get_unixfd_upload_chain() + " ! queue name=__stereo_output_q__"
+          " max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
           "leaky=downstream ! " + dvrk_gst::build_sink(abstract_name);
     }
 
-    if (!overlay_unixfd_sinks.empty()) {
-      if (stereo_branches > 1) {
-        output_chain +=
-            " __stereo_out__. ! queue name=__stereo_overlay_input_ts_q__ "
-            "max-size-buffers=1 leaky=downstream ! ";
-      } else {
-        output_chain +=
-            " ! queue name=__stereo_overlay_input_ts_q__ "
-            "max-size-buffers=1 leaky=downstream ! ";
-      }
-      output_chain +=
-          "gldownload ! videoconvert ! cairooverlay "
-          "name=stereo_overlay_unixfd ";
-
-      if (overlay_unixfd_sinks.size() > 1) {
-        output_chain += "! tee name=__overlay_out__ ";
-      }
-
-      int overlay_unixfd_index = 0;
-      for (const auto &sink : overlay_unixfd_sinks) {
-        const std::string abstract_name =
-            dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY);
-        if (overlay_unixfd_sinks.size() > 1) {
-          output_chain +=
-              " __overlay_out__. ! queue max-size-buffers=2 "
-              "max-size-time=0 max-size-bytes=0 leaky=downstream ! ";
-        } else {
-          output_chain += " ! ";
-        }
-        output_chain +=
-            "videoconvert ! video/x-raw,format=I420"
-            " ! queue name=__overlay_unixfd_ts_q" +
-            std::to_string(overlay_unixfd_index++) +
-            "__ max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
-            "leaky=downstream ! " + dvrk_gst::build_sink(abstract_name);
-      }
-    }
   } else {
     if (include_overlay) {
       output_chain +=
@@ -832,13 +737,13 @@ public:
     m_vbox.pack_start(m_btn_overlay, Gtk::PACK_SHRINK);
     m_vbox.pack_start(m_display_outputs.widget(), Gtk::PACK_SHRINK);
 
-    if (!m_cfg.extra_streams.monos.empty() || !m_cfg.extra_streams.stereos.empty()) {
+    if (!m_cfg.pip_gst_inputs.monos.empty() || !m_cfg.pip_gst_inputs.stereos.empty()) {
       m_scale_label.set_text("Extra Streams:");
       m_scale_label.set_halign(Gtk::ALIGN_START);
       m_extra_box.pack_start(m_scale_label, Gtk::PACK_SHRINK);
       
-      const int n_mono = static_cast<int>(m_cfg.extra_streams.monos.size());
-      const int n_stereo = static_cast<int>(m_cfg.extra_streams.stereos.size());
+      const int n_mono = static_cast<int>(m_cfg.pip_gst_inputs.monos.size());
+      const int n_stereo = static_cast<int>(m_cfg.pip_gst_inputs.stereos.size());
       const int n_extra = n_mono + n_stereo;
       const int gap = sv::AppConfig::gap_px;
       // Calculate max useful scale (assuming 4:3 source ratio bounding the width)
@@ -853,7 +758,7 @@ public:
       max_scale = std::min(0.95, std::max(0.1, max_scale));
 
       m_scale_slider.set_range(0.00, max_scale);
-      m_scale_slider.set_value(std::min(m_cfg.extra_streams.scale, max_scale));
+      m_scale_slider.set_value(std::min(m_cfg.pip_gst_inputs.scale, max_scale));
       m_scale_slider.set_digits(2);
       m_scale_slider.set_draw_value(true);
       m_scale_slider.set_increments(0.01, 0.05);
@@ -1113,60 +1018,42 @@ int main(int argc, char *argv[]) {
   if (cfg.original_width <= 0 || cfg.original_height <= 0) {
     RCLCPP_ERROR(node->get_logger(),
                  "Config '%s' must provide positive "
-                 "per-eye width and height via camera.size, "
-                 "stereo.eye_size, or stereo.size",
+                 "per-eye width and height via stereo.eye_size",
                  cfg.name.c_str());
     rclcpp::shutdown();
     return 1;
   }
 
-  // Populate cfg.stereo.source from unixfdsources "stereo" entry when
-  // stereo.stream was not set explicitly in the config.
-  // Build stereo.source from stereo.socket or unixfd_sources entry.
-  if (cfg.stereo.source.empty()) {
-    // Try stereo.socket field first (new convention).
-    if (!cfg.stereo.socket.empty()) {
-      const std::string abstract_name =
-          dvrk_gst::resolve(cfg.stereo.socket, dvrk_gst::ROLE_STEREO_ALIGNMENT);
-      cfg.stereo.source =
-          dvrk_gst::build_src(abstract_name, 2 * cfg.original_width,
-                              cfg.original_height);
-      RCLCPP_INFO(node->get_logger(), "Stereo source: %s", abstract_name.c_str());
-    } else {
-      // Fall back to unixfd_sources list (legacy / explicit socket path).
-      for (const auto &src : cfg.unixfd_sources) {
-        const std::string abstract_name =
-            dvrk_gst::resolve(src.socket, dvrk_gst::ROLE_STEREO_ALIGNMENT);
-        cfg.stereo.source =
-            dvrk_gst::build_src(abstract_name, 2 * cfg.original_width,
-                                cfg.original_height);
-        RCLCPP_INFO(node->get_logger(), "Stereo source: %s",
-                    abstract_name.c_str());
-        break;
-      }
-    }
-    if (cfg.stereo.source.empty()) {
-      RCLCPP_ERROR(node->get_logger(),
-                   "Config '%s' must define stereo.socket or stereo.stream",
-                   cfg.name.c_str());
-      rclcpp::shutdown();
-      return 1;
-    }
+  if (cfg.stereo.gst_input.empty()) {
+    RCLCPP_ERROR(node->get_logger(),
+                 "Config '%s' must define root gst_input",
+                 cfg.name.c_str());
+    rclcpp::shutdown();
+    return 1;
+  }
+
+  cfg.stereo.gst_input = dvrk_gst::build_input(
+      cfg.stereo.gst_input, dvrk_gst::ROLE_STEREO_ALIGNMENT,
+      2 * cfg.original_width, cfg.original_height);
+  cfg.ar.left.gst_input = dvrk_gst::build_input(
+      cfg.ar.left.gst_input, dvrk_gst::ROLE_STEREO_DISPLAY,
+      cfg.original_width, cfg.original_height);
+  cfg.ar.right.gst_input = dvrk_gst::build_input(
+      cfg.ar.right.gst_input, dvrk_gst::ROLE_STEREO_DISPLAY,
+      cfg.original_width, cfg.original_height);
+
+  if (!cfg.stereo.gst_output.empty() &&
+      dvrk_gst::resolve(cfg.stereo.gst_output).empty()) {
+    RCLCPP_ERROR(node->get_logger(), "Invalid gst_output socket reference: %s",
+                 cfg.stereo.gst_output.c_str());
+    rclcpp::shutdown();
+    return 1;
   }
 
   const sv::AppConfig &app_cfg = cfg;
 
-  warn_missing_unixfd_source_sockets(app_cfg, node->get_logger());
-
-  const std::string unixfd_upload_chain = get_unixfd_upload_chain();
-  if (!app_cfg.unixfd_sinks.empty()) {
-    for (const auto &sink : app_cfg.unixfd_sinks) {
-      RCLCPP_INFO(node->get_logger(), "unixfd sink: %s",
-                  dvrk_gst::resolve(sink.socket, dvrk_gst::ROLE_STEREO_DISPLAY).c_str());
-    }
-  } else {
-    RCLCPP_INFO(node->get_logger(), "No unixfd sinks configured");
-  }
+  RCLCPP_INFO(node->get_logger(), "stereo gst input: %s",
+              cfg.stereo.gst_input.c_str());
 
   if (app_cfg.sink_streams.empty()) {
     RCLCPP_WARN(node->get_logger(), "Resolved sink_streams list is empty");
@@ -1536,7 +1423,7 @@ int main(int argc, char *argv[]) {
     if (!control_window_ptr) return;
 
     RCLCPP_INFO(node->get_logger(),
-                "Rebuilding pipeline with extra_streams.scale=%.2f", new_scale);
+                "Rebuilding pipeline with pip_gst_inputs.scale=%.2f", new_scale);
 
     pipeline_user_data.reconnector.stop();
     // Stop and destroy old pipeline
@@ -1545,7 +1432,7 @@ int main(int argc, char *argv[]) {
     pipeline = nullptr;
 
     // Update scale in config copy (cfg is a local copy in main)
-    cfg.extra_streams.scale = new_scale;
+    cfg.pip_gst_inputs.scale = new_scale;
 
     // Rebuild pipeline string
     const std::string new_pipeline_str =

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dvrk_console:stereo_display@1.0.0",
+  "title": "dVRK stereo display configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["type", "gst_input", "eye_size"],
+  "properties": {
+    "type": { "const": "dvrk_console:stereo_display@1.0.0" },
+    "name": { "type": "string", "minLength": 1, "default": "dvrk_display" },
+    "dvrk_console_namespace": { "type": "string", "minLength": 1, "default": "console" },
+    "overlay_alpha": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
+    "preserve_size": { "type": "boolean", "default": true },
+    "display_horizontal_offset_px": { "type": "integer", "default": 0 },
+    "gst_input": { "$ref": "#/$defs/gstInput" },
+    "gst_output": { "$ref": "#/$defs/gstOutput" },
+    "eye_size": { "$ref": "#/$defs/size" },
+    "sinks": {
+      "type": "array",
+      "items": { "enum": ["glimage", "glimages"] },
+      "default": []
+    },
+    "pip_gst_inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "monos": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/inputEndpoint" },
+          "default": []
+        },
+        "stereos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["left", "right"],
+            "properties": {
+              "left": { "$ref": "#/$defs/inputEndpoint" },
+              "right": { "$ref": "#/$defs/inputEndpoint" }
+            }
+          },
+          "default": []
+        },
+        "scale": { "type": "number", "minimum": 0.01, "maximum": 0.99, "default": 0.3 }
+      }
+    },
+    "ar": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "left": { "$ref": "#/$defs/inputEndpoint" },
+        "right": { "$ref": "#/$defs/inputEndpoint" },
+        "color_key": {
+          "type": "array", "minItems": 3, "maxItems": 3,
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "size": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "gstInput": {
+      "type": "string", "minLength": 1,
+      "description": "Plain GStreamer pipeline or canonical @dvrk:role:name socket reference."
+    },
+    "gstOutput": {
+      "type": "string", "pattern": "^@dvrk:[^:]+:[^:]+$",
+      "description": "Canonical dVRK abstract socket reference."
+    },
+    "inputEndpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["gst_input"],
+      "properties": { "gst_input": { "$ref": "#/$defs/gstInput" } }
+    }
+  }
+}

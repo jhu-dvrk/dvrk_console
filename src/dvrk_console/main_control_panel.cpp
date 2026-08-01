@@ -72,7 +72,7 @@ struct CommandLineOptions {
 // ── Video source resolution and discovery ─────────────────────────────────────
 
 /// Build a label from an abstract socket name for display in the UI.
-/// "@dvrk_gst:role:name" → "name (role)"
+/// "@dvrk:role:name" → "name (role)"
 std::string video_source_label(const std::string &abstract_name) {
     const auto last_colon = abstract_name.rfind(':');
     if (last_colon == std::string::npos) return abstract_name;
@@ -85,12 +85,12 @@ std::string video_source_label(const std::string &abstract_name) {
 }
 
 /// Resolve a user-supplied source string to a fully-qualified abstract name.
-/// Accepts "@dvrk_gst:role:name", "role:name", or "name" (default role: stereo_display).
+/// Accepts the canonical "@dvrk:role:name" form.
 std::string resolve_video_source_path(const std::string &source) {
     return dvrk_gst::resolve(source, dvrk_gst::ROLE_STEREO_DISPLAY);
 }
 
-/// Scan /proc/net/unix for active @dvrk_gst abstract sockets.
+/// Scan /proc/net/unix for active @dvrk abstract sockets.
 std::vector<VideoSource> scan_available_video_sources() {
     std::vector<VideoSource> found;
     for (const auto &name : dvrk_gst::list_sockets()) {
@@ -109,7 +109,7 @@ void print_usage(const char *executable) {
               << std::endl;
     std::cerr << "  -c, --config   Control panel JSON config file" << std::endl;
     std::cerr << "  -C, --console  dVRK console namespace override" << std::endl;
-    std::cerr << "  -s, --source   Video source socket path or stream name" << std::endl;
+    std::cerr << "  -s, --source   Video source in @dvrk:role:name form" << std::endl;
 }
 
 bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
@@ -1874,6 +1874,11 @@ int main(int argc, char* argv[]) {
     std::unordered_set<std::string> seen_paths;
     for (const auto& source : config.video_sources) {
         const std::string abstract_name = resolve_video_source_path(source);
+        if (abstract_name.empty()) {
+            std::cerr << "Configuration error: video sources must use the canonical "
+                      << "@dvrk:role:name form: " << source << std::endl;
+            return 1;
+        }
         if (seen_paths.find(abstract_name) == seen_paths.end()) {
             video_sources.push_back(VideoSource{video_source_label(abstract_name), abstract_name});
             seen_paths.insert(abstract_name);

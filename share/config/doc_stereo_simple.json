@@ -2,9 +2,7 @@
   "type": "dvrk_console:stereo_display@1.0.0",
   "name": "stereo_simple",
   "dvrk_console_namespace": "console",
-  "stereo": {
-    "stream": "videotestsrc pattern=smpte is-live=true ! video/x-raw,width=1280,height=480,framerate=30/1",
-    "eye_size": {"width": 640, "height": 480}
-  },
+  "gst_input": "videotestsrc pattern=smpte is-live=true ! video/x-raw,width=1280,height=480,framerate=30/1",
+  "eye_size": {"width": 640, "height": 480},
   "sinks": ["glimage"]
 }

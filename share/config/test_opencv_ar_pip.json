@@ -2,20 +2,18 @@
   "type": "dvrk_console:stereo_display@1.0.0",
   "name": "test_opencv_ar_pip",
   "dvrk_console_namespace": "console",
-  "stereo": {
-    "stream": "videotestsrc pattern=smpte is-live=true ! video/x-raw,width=1280,height=480,framerate=30/1",
-    "eye_size": {"width": 640, "height": 480}
-  },
+  "gst_input": "videotestsrc pattern=smpte is-live=true ! video/x-raw,width=1280,height=480,framerate=30/1",
+  "eye_size": {"width": 640, "height": 480},
   "sinks": ["glimage"],
   "ar": {
     "enabled": true,
-    "left": "stereo_source:left_ar",
-    "right": "stereo_source:right_ar",
+    "left": {"gst_input": "@dvrk:stereo_source:left_ar"},
+    "right": {"gst_input": "@dvrk:stereo_source:right_ar"},
     "color_key": [0, 0, 255]
   },
-  "extra_streams": {
+  "pip_gst_inputs": {
     "monos": [
-      "videotestsrc pattern=ball is-live=true ! video/x-raw,width=320,height=240,framerate=30/1"
+      {"gst_input": "videotestsrc pattern=ball is-live=true ! video/x-raw,width=320,height=240,framerate=30/1"}
     ],
     "scale": 0.3
   }

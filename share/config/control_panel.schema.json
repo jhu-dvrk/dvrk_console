@@ -24,10 +24,11 @@
       "items": {
         "type": "string",
         "minLength": 1,
-        "description": "Socket in short-name, role:name, or @dvrk_gst:role:name form."
+        "pattern": "^@dvrk:[^:]+:[^:]+$",
+        "description": "Canonical dVRK abstract socket reference."
       },
       "uniqueItems": true,
-      "description": "Preferred video sockets. Other active @dvrk_gst sockets are discovered at startup."
+      "description": "Preferred @dvrk sockets. Other active sockets are discovered at startup."
     }
   }
 }

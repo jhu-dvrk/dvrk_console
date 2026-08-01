@@ -2,9 +2,7 @@
   "type": "dvrk_console:stereo_display@1.0.0",
   "name": "dvrk_display",
   "dvrk_console_namespace": "console",
-  "stereo": {
-    "socket": "stereo_alignment:stereo",
-    "eye_size": {"width": 1920, "height": 1080}
-  },
+  "gst_input": "@dvrk:stereo_alignment:stereo",
+  "eye_size": {"width": 1920, "height": 1080},
   "sinks": ["glimages"]
 }
