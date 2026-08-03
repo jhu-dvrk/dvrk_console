@@ -21,6 +21,7 @@ pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-video-1.0 gstreamer-app-1
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
 pkg_check_modules(CAIRO REQUIRED cairo)
 pkg_check_modules(GTKMM REQUIRED gtkmm-3.0)
+pkg_check_modules(X11 REQUIRED x11 xi)
 
 add_library(dvrk_console_overlay
   src/dvrk_console/overlay.cpp
@@ -88,6 +89,10 @@ foreach(exe stereo_display control_panel)
     dvrk_console_overlay
   )
 endforeach()
+
+target_include_directories(control_panel PRIVATE ${X11_INCLUDE_DIRS})
+target_compile_options(control_panel PRIVATE ${X11_CFLAGS_OTHER})
+target_link_libraries(control_panel ${X11_LIBRARIES})
 
 install(TARGETS
   stereo_display

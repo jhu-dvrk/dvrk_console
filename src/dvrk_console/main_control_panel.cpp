@@ -12,6 +12,10 @@
 #include <gst/gst.h>
 #include <gtkmm.h>
 #include <gdk/gdkkeysyms.h>
+#define Bool X11Bool
+#include <X11/Xlib.h>
+#include <X11/extensions/XInput2.h>
+#undef Bool
 
 #include <algorithm>
 #include <iostream>
@@ -26,6 +30,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <utility>
 
@@ -68,6 +73,81 @@ struct CommandLineOptions {
     bool console_override = false;
     std::vector<std::string> video_sources;
 };
+
+struct XInputPointerDevice {
+    int id = -1;
+    std::string name;
+    bool has_touch_class = false;
+    bool has_absolute_valuator = false;
+};
+
+std::vector<XInputPointerDevice> enumerate_xinput_pointer_devices() {
+    std::vector<XInputPointerDevice> devices;
+    Display* display = XOpenDisplay(nullptr);
+    if (!display) {
+        return devices;
+    }
+
+    int device_count = 0;
+    XIDeviceInfo* device_info = XIQueryDevice(display, XIAllDevices, &device_count);
+    if (device_info) {
+        for (int i = 0; i < device_count; ++i) {
+            const XIDeviceInfo& info = device_info[i];
+            if (info.use != XISlavePointer) {
+                continue;
+            }
+
+            XInputPointerDevice device;
+            device.id = info.deviceid;
+            device.name = info.name ? info.name : "(unnamed pointer device)";
+            for (int class_index = 0; class_index < info.num_classes; ++class_index) {
+                const XIAnyClassInfo* input_class = info.classes[class_index];
+                if (input_class->type == XITouchClass) {
+                    device.has_touch_class = true;
+                } else if (input_class->type == XIValuatorClass) {
+                    const auto* valuator =
+                        reinterpret_cast<const XIValuatorClassInfo*>(input_class);
+                    if (valuator->mode == XIModeAbsolute) {
+                        device.has_absolute_valuator = true;
+                    }
+                }
+            }
+            devices.push_back(std::move(device));
+        }
+        XIFreeDeviceInfo(device_info);
+    }
+    XCloseDisplay(display);
+
+    std::sort(devices.begin(), devices.end(),
+              [](const XInputPointerDevice& lhs, const XInputPointerDevice& rhs) {
+                  return lhs.name == rhs.name ? lhs.id < rhs.id : lhs.name < rhs.name;
+              });
+    return devices;
+}
+
+bool looks_like_touchscreen(const XInputPointerDevice& device) {
+    if (device.has_touch_class || device.has_absolute_valuator) {
+        return true;
+    }
+
+    std::string name = device.name;
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return name.find("touch") != std::string::npos ||
+           name.find("digitizer") != std::string::npos ||
+           name.find("digitiser") != std::string::npos ||
+           name.find("tablet") != std::string::npos ||
+           name.find("stylus") != std::string::npos ||
+           name.find("pen") != std::string::npos ||
+           name.find("egalax") != std::string::npos ||
+           name.find("ilitek") != std::string::npos ||
+           name.find("goodix") != std::string::npos ||
+           name.find("elan") != std::string::npos ||
+           name.find("wacom") != std::string::npos ||
+           name.find("weida") != std::string::npos ||
+           name.find("elo") != std::string::npos ||
+           name.find("wdt") != std::string::npos;
+}
 
 // ── Video source resolution and discovery ─────────────────────────────────────
 
@@ -1341,6 +1421,8 @@ private:
                                          enabled);
                 }
             }
+            key_file.set_string("touchscreen", "device_name",
+                                m_touchscreen_device_name);
             Glib::file_set_contents(path, key_file.to_data());
         } catch (const Glib::Error& error) {
             std::cerr << "Warning: unable to save user settings: "
@@ -1406,6 +1488,50 @@ private:
 
         menu.append(*is_touchscreen_item);
         menu.append(*not_touchscreen_item);
+
+        auto* device_item = create_menu_item("Input device");
+        auto* device_menu = Gtk::manage(new Gtk::Menu());
+        append_touchscreen_device_items(*device_menu);
+        device_item->set_submenu(*device_menu);
+        apply_menu_item_text_color(*device_item);
+        menu.append(*device_item);
+    }
+
+    void append_touchscreen_device_items(Gtk::Menu& menu) {
+        Gtk::RadioMenuItem::Group group;
+        auto* automatic_item = Gtk::manage(new Gtk::RadioMenuItem(group, "Automatic"));
+        apply_menu_item_text_color(*automatic_item);
+        automatic_item->set_active(m_touchscreen_device_name.empty());
+        automatic_item->signal_toggled().connect([this, automatic_item]() {
+            if (automatic_item->get_active()) {
+                set_touchscreen_device("");
+            }
+        });
+        menu.append(*automatic_item);
+
+        const auto devices = enumerate_xinput_pointer_devices();
+        for (const auto& device : devices) {
+            std::string label = device.name + " (id=" + std::to_string(device.id) + ")";
+            if (device.has_touch_class || device.has_absolute_valuator) {
+                label += " [absolute]";
+            }
+            auto* item = Gtk::manage(new Gtk::RadioMenuItem(group, label));
+            apply_menu_item_text_color(*item);
+            item->set_active(!m_touchscreen_device_name.empty() &&
+                             m_touchscreen_device_name == device.name);
+            item->signal_toggled().connect([this, item, device]() {
+                if (item->get_active()) {
+                    set_touchscreen_device(device.name);
+                }
+            });
+            menu.append(*item);
+        }
+
+        if (devices.empty()) {
+            auto* unavailable_item = create_menu_item("No slave pointer devices detected");
+            unavailable_item->set_sensitive(false);
+            menu.append(*unavailable_item);
+        }
     }
 
     int touchscreen_menu_monitor_index() {
@@ -1423,8 +1549,14 @@ private:
 
     void load_persisted_touchscreen_settings(Glib::KeyFile& key_file) {
         m_touchscreen_by_monitor.clear();
+        m_touchscreen_device_name.clear();
         if (!key_file.has_group("touchscreen")) {
             return;
+        }
+
+        if (key_file.has_key("touchscreen", "device_name")) {
+            m_touchscreen_device_name =
+                key_file.get_string("touchscreen", "device_name");
         }
 
         constexpr int max_persisted_monitors = 32;
@@ -1434,6 +1566,13 @@ private:
                 m_touchscreen_by_monitor[i] = key_file.get_boolean("touchscreen", key);
             }
         }
+    }
+
+    void set_touchscreen_device(const std::string& device_name) {
+        m_touchscreen_device_name = device_name;
+        m_last_touchscreen_apply_monitor_index = -1;
+        save_persisted_user_settings();
+        apply_touchscreen_settings_for_current_monitor(true);
     }
 
     bool is_touchscreen_monitor(int monitor_index) const {
@@ -1487,86 +1626,90 @@ private:
             return;
         }
 
-        const std::string geometry = monitor_geometry_string(monitor_index);
-        if (geometry.empty()) {
+        Gdk::Rectangle geometry;
+        if (!monitor_geometry(monitor_index, geometry)) {
             std::cerr << "Warning: unable to configure touchscreen for monitor "
                       << monitor_index << ": monitor geometry unavailable" << std::endl;
             return;
         }
 
-        const std::string command =
-            "output=$(xrandr --query 2>/dev/null | grep ' connected' | grep " +
-            shell_quote(geometry) +
-            " | head -n 1 | cut -d' ' -f1); "
-            "if [ -z \"$output\" ]; then echo \"dvrk_console: no xrandr output found for monitor geometry " +
-            geometry +
-            "\" >&2; exit 1; fi; "
-            "device=$(xinput list 2>/dev/null "
-            "| grep -iE 'slave[[:space:]]+pointer' "
-            "| grep -viE 'touchpad' "
-            "| grep -iE 'touchscreen|touch screen|mtouch|multi.?touch|touch.*screen|touch.*controller|touch controller|touch' "
-            "| sed -n 's/.*id=\\([0-9][0-9]*\\).*/\\1/p' "
-            "| head -n 1); "
-            "if [ -z \"$device\" ]; then echo \"dvrk_console: no touchscreen pointer input device found\" >&2; exit 1; fi; "
-            "echo \"dvrk_console: mapping touchscreen input id $device to output $output (" +
-            geometry +
-            ")\" >&2; "
-            "xinput map-to-output \"$device\" \"$output\"";
+        const auto devices = enumerate_xinput_pointer_devices();
+        std::optional<XInputPointerDevice> selected_device;
+        if (!m_touchscreen_device_name.empty()) {
+            for (const auto& device : devices) {
+                if (device.name == m_touchscreen_device_name) {
+                    selected_device = device;
+                    break;
+                }
+            }
+        } else {
+            for (const auto& device : devices) {
+                if (looks_like_touchscreen(device)) {
+                    selected_device = device;
+                    break;
+                }
+            }
+        }
+
+        if (!selected_device) {
+            const std::string requested_device =
+                m_touchscreen_device_name.empty()
+                    ? "touchscreen"
+                    : "selected pointer device '" + m_touchscreen_device_name + "'";
+            std::cerr << "Warning: unable to configure touchscreen: no matching "
+                      << requested_device
+                      << " found" << std::endl;
+            return;
+        }
+
+        Display* display = XOpenDisplay(nullptr);
+        if (!display) {
+            std::cerr << "Warning: unable to configure touchscreen: unable to open X display"
+                      << std::endl;
+            return;
+        }
+
+        const int screen = DefaultScreen(display);
+        const double screen_width = DisplayWidth(display, screen);
+        const double screen_height = DisplayHeight(display, screen);
+        if (screen_width <= 0 || screen_height <= 0) {
+            XCloseDisplay(display);
+            std::cerr << "Warning: unable to configure touchscreen: invalid X screen size"
+                      << std::endl;
+            return;
+        }
+
+        const float matrix[9] = {
+            static_cast<float>(geometry.get_width() / screen_width), 0.0f,
+            static_cast<float>(geometry.get_x() / screen_width),
+            0.0f, static_cast<float>(geometry.get_height() / screen_height),
+            static_cast<float>(geometry.get_y() / screen_height),
+            0.0f, 0.0f, 1.0f};
+        const Atom property = XInternAtom(display, "Coordinate Transformation Matrix", False);
+        const Atom float_type = XInternAtom(display, "FLOAT", False);
+        XIChangeProperty(display, selected_device->id, property, float_type, 32,
+                         XIPropModeReplace,
+                         reinterpret_cast<unsigned char*>(const_cast<float*>(matrix)), 9);
+        XSync(display, False);
+        XCloseDisplay(display);
 
         std::cerr << "Configuring touchscreen for monitor " << monitor_index
-                  << " (" << geometry << ")" << std::endl;
-        if (run_shell_command(command, "configure touchscreen")) {
-            m_last_touchscreen_apply_monitor_index = monitor_index;
-        }
+                  << " using '" << selected_device->name << "' (id="
+                  << selected_device->id << ")" << std::endl;
+        m_last_touchscreen_apply_monitor_index = monitor_index;
     }
 
-    std::string monitor_geometry_string(int monitor_index) const {
+    bool monitor_geometry(int monitor_index, Gdk::Rectangle& geometry) const {
         auto display = Gdk::Display::get_default();
         if (!display || monitor_index < 0 || monitor_index >= display->get_n_monitors()) {
-            return "";
+            return false;
         }
 
         auto monitor = display->get_monitor(monitor_index);
         if (!monitor) {
-            return "";
-        }
-
-        Gdk::Rectangle geometry;
-        monitor->get_geometry(geometry);
-        std::ostringstream ss;
-        ss << geometry.get_width() << "x" << geometry.get_height();
-        append_xrandr_offset(ss, geometry.get_x());
-        append_xrandr_offset(ss, geometry.get_y());
-        return ss.str();
-    }
-
-    static void append_xrandr_offset(std::ostringstream& ss, int offset) {
-        if (offset >= 0) {
-            ss << "+";
-        }
-        ss << offset;
-    }
-
-    static std::string shell_quote(const std::string& value) {
-        std::string quoted = "'";
-        for (char ch : value) {
-            if (ch == '\'') {
-                quoted += "'\\''";
-            } else {
-                quoted += ch;
-            }
-        }
-        quoted += "'";
-        return quoted;
-    }
-
-    static bool run_shell_command(const std::string& command, const std::string& description) {
-        const int result = std::system(command.c_str());
-        if (result != 0) {
-            std::cerr << "Warning: unable to " << description
-                      << " (command exited with status " << result << ")" << std::endl;
             return false;
         }
+        monitor->get_geometry(geometry);
         return true;
     }
 
@@ -1833,6 +1976,7 @@ private:
     bool m_window_fullscreen = false;
     bool m_have_persisted_display_settings = false;
     std::unordered_map<int, bool> m_touchscreen_by_monitor;
+    std::string m_touchscreen_device_name;
     int m_last_touchscreen_apply_monitor_index = -1;
     std::unique_ptr<sv::WindowMonitorManager> m_monitor_manager;
 
