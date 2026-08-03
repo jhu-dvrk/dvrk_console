@@ -490,7 +490,7 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
     const double padding = std::max(4.0, theme.h_spacing * 0.5);
     const double margin = theme.h_spacing;
 
-    auto draw_eye_label = [&](const char *label, double x, bool align_right) {
+    auto draw_eye_label = [&](const char *label, double x) {
       cairo_save(cr);
       cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
                              CAIRO_FONT_WEIGHT_BOLD);
@@ -498,9 +498,7 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
 
       cairo_text_extents_t extents;
       cairo_text_extents(cr, label, &extents);
-      const double text_x = align_right
-                                ? x - extents.width - extents.x_bearing
-                                : x - extents.x_bearing;
+      const double text_x = x - extents.width * 0.5 - extents.x_bearing;
       const double text_y = margin + padding + extents.height;
 
       cairo_set_source_rgba(cr, 0.05, 0.05, 0.05, 0.72);
@@ -516,12 +514,12 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
     };
 
     if (is_stereo_layout) {
-      draw_eye_label("L", margin, false);
-      draw_eye_label("R", static_cast<double>(frame_width) - margin, true);
+      draw_eye_label("L", eye_width * 0.5);
+      draw_eye_label("R", eye_width * 1.5);
     } else if (overlay_view == OverlayView::LeftEye) {
-      draw_eye_label("L", margin, false);
+      draw_eye_label("L", eye_width * 0.25);
     } else if (overlay_view == OverlayView::RightEye) {
-      draw_eye_label("R", static_cast<double>(frame_width) - margin, true);
+      draw_eye_label("R", eye_width * 0.75);
     }
   }
 
