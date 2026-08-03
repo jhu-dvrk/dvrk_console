@@ -736,6 +736,14 @@ public:
     m_btn_overlay.signal_toggled().connect(
         sigc::mem_fun(*this, &ControlWindow::on_overlay_toggled));
     m_vbox.pack_start(m_btn_overlay, Gtk::PACK_SHRINK);
+
+    m_btn_eye_labels.set_label("L/R Labels");
+    m_btn_eye_labels.set_active(false);
+    m_btn_eye_labels.set_sensitive(m_btn_overlay.get_active());
+    m_btn_eye_labels.signal_toggled().connect(
+        sigc::mem_fun(*this, &ControlWindow::on_eye_labels_toggled));
+    m_vbox.pack_start(m_btn_eye_labels, Gtk::PACK_SHRINK);
+
     m_vbox.pack_start(m_display_outputs.widget(), Gtk::PACK_SHRINK);
 
     if (!m_cfg.pip_gst_inputs.monos.empty() || !m_cfg.pip_gst_inputs.stereos.empty()) {
@@ -852,6 +860,12 @@ protected:
   void on_overlay_toggled() {
     std::scoped_lock<std::mutex> lock(m_overlay_state->mutex);
     m_overlay_state->overlay_enabled = m_btn_overlay.get_active();
+    m_btn_eye_labels.set_sensitive(m_btn_overlay.get_active());
+  }
+
+  void on_eye_labels_toggled() {
+    std::scoped_lock<std::mutex> lock(m_overlay_state->mutex);
+    m_overlay_state->show_eye_labels = m_btn_eye_labels.get_active();
   }
 
   void on_scale_released() {
@@ -906,6 +920,7 @@ protected:
   Gtk::Box m_vbox;
   Gtk::Box m_extra_box{Gtk::ORIENTATION_HORIZONTAL, 8};
   Gtk::ToggleButton m_btn_overlay;
+  Gtk::ToggleButton m_btn_eye_labels;
   Gtk::Button m_btn_quit;
   Gtk::Label m_scale_label;
   Gtk::Scale m_scale_slider{Gtk::ORIENTATION_HORIZONTAL};

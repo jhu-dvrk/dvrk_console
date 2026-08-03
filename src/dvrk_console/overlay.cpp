@@ -392,6 +392,7 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   int frame_height = 0;
   double overlay_alpha = 0.7;
   int display_horizontal_offset_px = 0;
+  bool show_eye_labels = false;
   bool show_grid = false;
   double camera_roll = 0.0;
   std::unordered_map<std::string, ArmOverlayInfo> arm_info;
@@ -436,6 +437,7 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
     }
     overlay_alpha = overlay_state->overlay_alpha;
     display_horizontal_offset_px = overlay_state->display_horizontal_offset_px;
+    show_eye_labels = overlay_state->show_eye_labels;
     show_grid = overlay_state->show_grid;
     camera_roll = overlay_state->camera_roll;
     arm_info = overlay_state->arm_info;
@@ -482,6 +484,46 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
           : 1.0;
 
   const OverlayTheme theme(image_scale);
+
+  if (show_eye_labels) {
+    const double font_size = std::max(18.0, theme.radius * 2.4);
+    const double padding = std::max(4.0, theme.h_spacing * 0.5);
+    const double margin = theme.h_spacing;
+
+    auto draw_eye_label = [&](const char *label, double x, bool align_right) {
+      cairo_save(cr);
+      cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
+                             CAIRO_FONT_WEIGHT_BOLD);
+      cairo_set_font_size(cr, font_size);
+
+      cairo_text_extents_t extents;
+      cairo_text_extents(cr, label, &extents);
+      const double text_x = align_right
+                                ? x - extents.width - extents.x_bearing
+                                : x - extents.x_bearing;
+      const double text_y = margin + padding + extents.height;
+
+      cairo_set_source_rgba(cr, 0.05, 0.05, 0.05, 0.72);
+      cairo_rectangle(cr, text_x - padding, margin,
+                      extents.width + 2.0 * padding,
+                      extents.height + 2.0 * padding);
+      cairo_fill(cr);
+
+      cairo_set_source_rgba(cr, 0.98, 0.98, 0.98, overlay_alpha);
+      cairo_move_to(cr, text_x, text_y);
+      cairo_show_text(cr, label);
+      cairo_restore(cr);
+    };
+
+    if (is_stereo_layout) {
+      draw_eye_label("L", margin, false);
+      draw_eye_label("R", static_cast<double>(frame_width) - margin, true);
+    } else if (overlay_view == OverlayView::LeftEye) {
+      draw_eye_label("L", margin, false);
+    } else if (overlay_view == OverlayView::RightEye) {
+      draw_eye_label("R", static_cast<double>(frame_width) - margin, true);
+    }
+  }
 
   // Draw calibration grid (same pattern as the calibration script)
   if (show_grid) {
@@ -717,19 +759,6 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   } else {
     // Per-eye window: images fill the full frame (no squeezing), so place
     // the PSM columns at the frame edges with the display-offset shift applied.
-
-    // Grey corner dot to distinguish left (top-left) from right (top-right).
-    {
-      constexpr double k_eye_dot_radius_ratio = 2.0 / 425.0;
-      const double dot_r = image_scale * k_eye_dot_radius_ratio;
-      const double dot_x = (overlay_view == OverlayView::LeftEye)
-                               ? dot_r
-                               : static_cast<double>(frame_width) - dot_r;
-      cairo_new_path(cr);
-      cairo_arc(cr, dot_x, dot_r, dot_r, 0.0, 2.0 * M_PI);
-      cairo_set_source_rgba(cr, 0.82, 0.82, 0.82, overlay_alpha);
-      cairo_fill(cr);
-    }
 
     const double sign =
         (overlay_view == OverlayView::LeftEye) ? -1.0 : 1.0;

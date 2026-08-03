@@ -67,6 +67,7 @@ struct OverlayState {
     int frame_width = 0;
     int frame_height = 0;
     bool overlay_enabled = true;
+    bool show_eye_labels = false;
     bool show_grid = false;
     double overlay_alpha = 0.7;
     int display_horizontal_offset_px = 0;
