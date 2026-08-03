@@ -74,7 +74,11 @@
       "description": "Plain GStreamer pipeline or canonical @dvrk:role:name socket reference."
     },
     "gstOutput": {
-      "type": "string", "pattern": "^@dvrk:[^:]+:[^:]+$",
+      "type": "string",
+      "anyOf": [
+        { "const": "" },
+        { "pattern": "^@dvrk:[^:]+:[^:]+$" }
+      ],
       "description": "Canonical dVRK abstract socket reference."
     },
     "inputEndpoint": {

@@ -186,10 +186,6 @@ bool check_element_available(const std::string &element_name) {
   return false;
 }
 
-std::string get_unixfd_upload_chain() {
-  return "gldownload ! videoconvert ! video/x-raw,format=I420";
-}
-
 GstPadProbeReturn frame_timestamp_probe_cb(GstPad *pad, GstPadProbeInfo *info,
                                            gpointer user_data) {
   (void)pad;
@@ -690,8 +686,13 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
             " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
             "leaky=downstream ! ";
       }
+      output_chain += "gldownload ! videoconvert ";
+      if (include_overlay) {
+        output_chain += "! cairooverlay name=stereo_overlay_unixfd ";
+      }
       output_chain +=
-          get_unixfd_upload_chain() + " ! queue name=__stereo_output_q__"
+          "! videoconvert ! video/x-raw,format=I420"
+          " ! queue name=__stereo_output_q__"
           " max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
           "leaky=downstream ! " + dvrk_gst::build_sink(abstract_name);
     }
@@ -1030,6 +1031,11 @@ int main(int argc, char *argv[]) {
                  cfg.name.c_str());
     rclcpp::shutdown();
     return 1;
+  }
+
+  if (!cfg.stereo.gst_output_specified) {
+    cfg.stereo.gst_output =
+        dvrk_gst::make(dvrk_gst::ROLE_STEREO_DISPLAY, "overlay");
   }
 
   cfg.stereo.gst_input = dvrk_gst::build_input(
