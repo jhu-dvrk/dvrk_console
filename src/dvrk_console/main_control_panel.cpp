@@ -12,10 +12,11 @@
 #include <gst/gst.h>
 #include <gtkmm.h>
 #include <gdk/gdkkeysyms.h>
-#define Bool X11Bool
 #include <X11/Xlib.h>
 #include <X11/extensions/XInput2.h>
+#ifdef Bool
 #undef Bool
+#endif
 
 #include <algorithm>
 #include <iostream>
@@ -148,6 +149,49 @@ bool looks_like_touchscreen(const XInputPointerDevice& device) {
            name.find("elo") != std::string::npos ||
            name.find("wdt") != std::string::npos;
 }
+
+class TouchOverlay : public Gtk::Overlay {
+public:
+    void show_at(double x, double y) {
+        m_x = x;
+        m_y = y;
+        m_visible = true;
+        queue_draw();
+    }
+
+    void hide_indicator() {
+        if (!m_visible) {
+            return;
+        }
+        m_visible = false;
+        queue_draw();
+    }
+
+protected:
+    bool on_draw(const Cairo::RefPtr<Cairo::Context>& context) override {
+        const bool handled = Gtk::Overlay::on_draw(context);
+        if (!m_visible) {
+            return handled;
+        }
+
+        constexpr double radius = 18.0;
+        context->save();
+        // Cairo paths are not included in save()/restore(). Discard any path
+        // left by child widgets so stroke() draws only the touch circle.
+        context->begin_new_path();
+        context->set_source_rgba(1.0, 0.35, 0.0, 0.9);
+        context->set_line_width(4.0);
+        context->arc(m_x, m_y, radius, 0.0, 6.283185307179586);
+        context->stroke();
+        context->restore();
+        return handled;
+    }
+
+private:
+    double m_x = 0.0;
+    double m_y = 0.0;
+    bool m_visible = false;
+};
 
 // ── Video source resolution and discovery ─────────────────────────────────────
 
@@ -304,6 +348,7 @@ public:
         : m_node(node), m_settings_name(settings_name), m_console_name(console_name),
           m_video_sources(video_sources),
           m_explicit_video_sources(video_sources),
+          m_root_overlay(),
           m_main_paned(Gtk::ORIENTATION_HORIZONTAL),
           m_left_pane(Gtk::ORIENTATION_VERTICAL, 10),
           m_right_pane(Gtk::ORIENTATION_VERTICAL, 5),
@@ -333,7 +378,31 @@ public:
         m_main_paned.pack1(m_left_pane, false, false); // Keep left controls fixed size on window resize
         m_main_paned.pack2(m_right_pane, true, false);  // Let right video expand to fill extra space
         m_main_paned.set_position(380); // Heuristic initial split: 380px for controls, rest for video
-        add(m_main_paned);
+        m_root_overlay.add(m_main_paned);
+        add(m_root_overlay);
+
+        // Observe touch sequences during GTK's capture phase without claiming
+        // them. The underlying buttons and sliders continue to receive the
+        // normal GTK touch/pointer-emulated events.
+        m_touch_press_gesture = Gtk::GestureMultiPress::create(m_root_overlay);
+        m_touch_press_gesture->set_touch_only(true);
+        m_touch_press_gesture->set_exclusive(false);
+        m_touch_press_gesture->set_propagation_phase(Gtk::PHASE_CAPTURE);
+        m_touch_press_gesture->signal_pressed().connect(
+            sigc::mem_fun(*this, &ControlPanelWindow::on_touch_pressed));
+        m_touch_press_gesture->signal_released().connect(
+            sigc::mem_fun(*this, &ControlPanelWindow::on_touch_released));
+
+        m_touch_drag_gesture = Gtk::GestureDrag::create(m_root_overlay);
+        m_touch_drag_gesture->set_touch_only(true);
+        m_touch_drag_gesture->set_exclusive(false);
+        m_touch_drag_gesture->set_propagation_phase(Gtk::PHASE_CAPTURE);
+        m_touch_drag_gesture->signal_drag_begin().connect(
+            sigc::mem_fun(*this, &ControlPanelWindow::on_touch_drag_begin));
+        m_touch_drag_gesture->signal_drag_update().connect(
+            sigc::mem_fun(*this, &ControlPanelWindow::on_touch_drag_update));
+        m_touch_drag_gesture->signal_drag_end().connect(
+            sigc::mem_fun(*this, &ControlPanelWindow::on_touch_drag_end));
 
         if (m_video_sources.empty()) {
             m_right_pane.hide();
@@ -394,6 +463,30 @@ protected:
     }
 
 private:
+    void on_touch_pressed(int /*press_count*/, double x, double y) {
+        m_root_overlay.show_at(x, y);
+    }
+
+    void on_touch_released(int /*press_count*/, double /*x*/, double /*y*/) {
+        m_root_overlay.hide_indicator();
+    }
+
+    void on_touch_drag_begin(double x, double y) {
+        m_root_overlay.show_at(x, y);
+    }
+
+    void on_touch_drag_update(double offset_x, double offset_y) {
+        double start_x = 0.0;
+        double start_y = 0.0;
+        if (m_touch_drag_gesture->get_start_point(start_x, start_y)) {
+            m_root_overlay.show_at(start_x + offset_x, start_y + offset_y);
+        }
+    }
+
+    void on_touch_drag_end(double /*offset_x*/, double /*offset_y*/) {
+        m_root_overlay.hide_indicator();
+    }
+
     void setup_styles() {
         m_css_provider = Gtk::CssProvider::create();
         auto screen = Gdk::Screen::get_default();
@@ -1895,9 +1988,12 @@ private:
     std::unordered_map<std::string, rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> m_teleop_state_subs;
 
     // UI Widgets
+    TouchOverlay m_root_overlay;
     Gtk::Paned m_main_paned;
     Gtk::Box m_left_pane;
     Gtk::Box m_right_pane;
+    Glib::RefPtr<Gtk::GestureMultiPress> m_touch_press_gesture;
+    Glib::RefPtr<Gtk::GestureDrag> m_touch_drag_gesture;
 
     Gtk::Frame m_arms_frame;
     Gtk::Box m_arms_box;
