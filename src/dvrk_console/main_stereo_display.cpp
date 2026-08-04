@@ -9,10 +9,6 @@
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 
-#include <chrono>
-#include <deque>
-#include <iomanip>
-#include <sstream>
 
 #include <gst/video/navigation.h>
 #include <gtkmm.h>
@@ -36,54 +32,15 @@
 #include <dvrk_data/config.hpp>
 #include <dvrk_data/dvrk_gst_socket.hpp>
 #include "display_output_panel.hpp"
-#include "overlay.hpp"
+#include "overlay_renderer.hpp"
+#include "overlay_ros.hpp"
+#include "overlay_state.hpp"
+#include "glib_ros_executor.hpp"
+#include "gst_pipeline_runtime.hpp"
 #include <dvrk_data/cpu_timestamp_meta.hpp>
 #include <dvrk_data/stereo_common.hpp>
 
 namespace {
-
-class FpsTracker {
-public:
-  void update() {
-    std::scoped_lock<std::mutex> lock(m_mutex);
-    m_frame_times.push_back(std::chrono::steady_clock::now());
-    m_total_count++;
-  }
-
-  double get_fps() {
-    std::scoped_lock<std::mutex> lock(m_mutex);
-    auto now = std::chrono::steady_clock::now();
-    while (!m_frame_times.empty() && now - m_frame_times.front() > std::chrono::seconds(2)) {
-      m_frame_times.pop_front();
-    }
-    if (m_frame_times.size() < 2) {
-      return 0.0;
-    }
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(m_frame_times.back() - m_frame_times.front()).count();
-    if (duration == 0) return 0.0;
-    return static_cast<double>(m_frame_times.size() - 1) / (duration / 1000.0);
-  }
-
-  uint64_t get_count() const {
-    return m_total_count;
-  }
-
-private:
-  std::mutex m_mutex;
-  std::deque<std::chrono::steady_clock::time_point> m_frame_times;
-  uint64_t m_total_count = 0;
-};
-
-static GstPadProbeReturn sink_fps_probe_cb(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
-  (void)pad;
-  if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
-    auto *tracker = static_cast<FpsTracker *>(user_data);
-    if (tracker) {
-      tracker->update();
-    }
-  }
-  return GST_PAD_PROBE_OK;
-}
 
 struct CommandLineOptions {
   std::string config_file;
@@ -305,7 +262,7 @@ void attach_ar_timestamp_probes(GstElement *pipeline) {
   }
 }
 
-void attach_timestamp_probes(GstElement *pipeline, const sv::AppConfig &cfg,
+void attach_timestamp_probes(GstElement *pipeline, const dvrk_data::AppConfig &cfg,
                              FrameTimestampState *timestamp_state) {
   add_timestamp_probe(pipeline, "__stereo_src_q__", timestamp_state);
   if (!cfg.stereo.gst_output.empty())
@@ -319,23 +276,13 @@ gboolean on_sigint(gpointer) {
   return G_SOURCE_REMOVE;
 }
 
-gboolean on_ros_spin(gpointer user_data) {
-  if (user_data == nullptr || !rclcpp::ok()) {
-    return G_SOURCE_CONTINUE;
-  }
-
-  auto *node = static_cast<rclcpp::Node *>(user_data);
-  rclcpp::spin_some(node->get_node_base_interface());
-  return G_SOURCE_CONTINUE;
-}
-
 // Removed local on_bus_message in favor of dc_stereo::on_bus_message
 
 // Helper: ensure a pixel count is even (round down)
 static int make_even(int v) { return v & ~1; }
 
 std::string
-build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
+build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_overlay) {
   const int eye_w = stereo.original_width;
   const int eye_h = stereo.original_height;
   const int stereo_w = 2 * eye_w;
@@ -359,7 +306,7 @@ build_pipeline_string(const sv::AppConfig &stereo, const bool include_overlay) {
   int extra_h = 0;
   int gap_px = 0;
   if (has_extra) {
-    gap_px = sv::AppConfig::gap_px;
+    gap_px = dvrk_data::AppConfig::gap_px;
     stereo_h =
         make_even(static_cast<int>(std::round(eye_h * (1.0 - es.scale))));
     stereo_h = std::max(2, std::min(eye_h - 2, stereo_h));
@@ -712,9 +659,9 @@ class ControlWindow : public Gtk::Window {
 public:
   using RebuildCb = std::function<void(double new_scale)>;
 
-  ControlWindow(std::shared_ptr<sv::OverlayState> overlay_state,
+  ControlWindow(std::shared_ptr<dvrk_console::OverlayState> overlay_state,
                 GstElement *pipeline,
-                const sv::AppConfig &cfg,
+                const dvrk_data::AppConfig &cfg,
                 RebuildCb rebuild_cb)
       : m_overlay_state(overlay_state), m_pipeline(pipeline),
         m_cfg(cfg), m_rebuild_cb(std::move(rebuild_cb)),
@@ -724,12 +671,6 @@ public:
     m_vbox.set_orientation(Gtk::ORIENTATION_VERTICAL);
     m_vbox.set_spacing(8);
     add(m_vbox);
-
-    m_fps_label.set_halign(Gtk::ALIGN_CENTER);
-    m_vbox.pack_start(m_fps_label, Gtk::PACK_SHRINK);
-
-    m_fps_timer = Glib::signal_timeout().connect(
-        sigc::mem_fun(*this, &ControlWindow::on_update_fps), 500);
 
     m_btn_overlay.set_label("Overlay");
     m_btn_overlay.set_active(true);
@@ -754,7 +695,7 @@ public:
       const int n_mono = static_cast<int>(m_cfg.pip_gst_inputs.monos.size());
       const int n_stereo = static_cast<int>(m_cfg.pip_gst_inputs.stereos.size());
       const int n_extra = n_mono + n_stereo;
-      const int gap = sv::AppConfig::gap_px;
+      const int gap = dvrk_data::AppConfig::gap_px;
       // Calculate max useful scale (assuming 4:3 source ratio bounding the width)
       int eye_w = m_cfg.original_width;
       if (eye_w == 0) eye_w = 640; // fallback
@@ -794,33 +735,11 @@ public:
     setup_display_windows(pipeline);
   }
 
-  ~ControlWindow() override {
-    m_fps_timer.disconnect();
-  }
-
-  void attach_sink_probe(GstElement *pipeline, const std::string &sink_name, FpsTracker *tracker) {
-    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), sink_name.c_str());
-    if (sink) {
-      GstPad *pad = gst_element_get_static_pad(sink, "sink");
-      if (pad) {
-        gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-                          sink_fps_probe_cb, tracker, nullptr);
-        gst_object_unref(pad);
-      }
-      gst_object_unref(sink);
-    }
-  }
+  ~ControlWindow() override = default;
 
   void setup_display_windows(GstElement *pipeline) {
     m_pipeline = pipeline;
-    m_has_display_sinks = false;
-    
-    // Attach pad probes to measure FPS/Hz
-    attach_sink_probe(pipeline, "__left_eye_sink__", &m_left_tracker);
-    attach_sink_probe(pipeline, "__right_eye_sink__", &m_right_tracker);
-    attach_sink_probe(pipeline, "__stereo_sink__", &m_stereo_tracker);
-
-    std::vector<sv::DisplayOutputPanel::SinkDescriptor> sinks;
+    std::vector<dvrk_console::DisplayOutputPanel::SinkDescriptor> sinks;
     const std::vector<std::string> sink_names = {
         "__left_eye_sink__", "__right_eye_sink__", "__stereo_sink__"};
     for (const auto &sname : sink_names) {
@@ -830,7 +749,7 @@ public:
       g_object_get(sink, "widget", &gtk_widget, NULL);
       gst_object_unref(sink);
       if (!gtk_widget) continue;
-      sv::DisplayOutputPanel::SinkDescriptor desc;
+      dvrk_console::DisplayOutputPanel::SinkDescriptor desc;
       desc.sink_name = sname;
       desc.label = sname == "__stereo_sink__"    ? "Stereo"
                    : sname == "__left_eye_sink__" ? "Left Eye"
@@ -843,7 +762,6 @@ public:
       desc.gtk_widget = gtk_widget;
       sinks.push_back(std::move(desc));
     }
-    m_has_display_sinks = !sinks.empty();
     m_display_outputs.rebuild(sinks);
     show_all_children();
   }
@@ -876,47 +794,11 @@ protected:
     if (g_app) g_app->quit();
   }
 
-  bool on_update_fps() {
-    std::string fps_text = "Rendering rate (CPU counters): ";
-    bool any = false;
-    
-    auto format_fps = [](double fps) -> std::string {
-      std::ostringstream ss;
-      ss << std::fixed << std::setprecision(1) << fps;
-      return ss.str();
-    };
-
-    if (m_stereo_tracker.get_count() > 0) {
-      fps_text += " Stereo: " + format_fps(m_stereo_tracker.get_fps()) + " Hz";
-      any = true;
-    }
-    if (m_left_tracker.get_count() > 0) {
-      if (any) fps_text += " |";
-      fps_text += " Left: " + format_fps(m_left_tracker.get_fps()) + " Hz";
-      any = true;
-    }
-    if (m_right_tracker.get_count() > 0) {
-      if (any) fps_text += " |";
-      fps_text += " Right: " + format_fps(m_right_tracker.get_fps()) + " Hz";
-      any = true;
-    }
-
-    if (!any && m_has_display_sinks) {
-      fps_text += " Waiting for active sinks...";
-    } else if (!any) {
-      fps_text += " No display sinks configured";
-    }
-    
-    m_fps_label.set_markup("<span weight='bold' size='medium'>" + fps_text + "</span>");
-    return true;
-  }
-
-  std::shared_ptr<sv::OverlayState> m_overlay_state;
+  std::shared_ptr<dvrk_console::OverlayState> m_overlay_state;
   GstElement *m_pipeline;
-  const sv::AppConfig &m_cfg;
+  const dvrk_data::AppConfig &m_cfg;
   RebuildCb m_rebuild_cb;
   bool m_scale_visible = false;
-  bool m_has_display_sinks = false;
   Gtk::Box m_vbox;
   Gtk::Box m_extra_box{Gtk::ORIENTATION_HORIZONTAL, 8};
   Gtk::ToggleButton m_btn_overlay;
@@ -924,12 +806,7 @@ protected:
   Gtk::Button m_btn_quit;
   Gtk::Label m_scale_label;
   Gtk::Scale m_scale_slider{Gtk::ORIENTATION_HORIZONTAL};
-  sv::DisplayOutputPanel m_display_outputs;
-  Gtk::Label m_fps_label;
-  FpsTracker m_left_tracker;
-  FpsTracker m_right_tracker;
-  FpsTracker m_stereo_tracker;
-  sigc::connection m_fps_timer;
+  dvrk_console::DisplayOutputPanel m_display_outputs;
 };
 } // namespace
 
@@ -952,7 +829,7 @@ int main(int argc, char *argv[]) {
   }
 
   auto node = std::make_shared<rclcpp::Node>("dvrk_console");
-  auto overlay_state = std::make_shared<sv::OverlayState>();
+  auto overlay_state = std::make_shared<dvrk_console::OverlayState>();
 
   std::string console_name = "console";
 
@@ -972,19 +849,19 @@ int main(int argc, char *argv[]) {
   }
 
   Json::Value root;
-  if (!sv::Config::load_from_file(path, root)) {
+  if (!dvrk_data::Config::load_from_file(path, root)) {
     rclcpp::shutdown();
     return 1;
   }
 
-  if (!sv::Config::check_type(root, "dvrk_console:stereo_display@1.0.0", path)) {
+  if (!dvrk_data::Config::check_type(root, "dvrk_console:stereo_display@1.0.0", path)) {
     rclcpp::shutdown();
     return 1;
   }
 
-  sv::AppConfig cfg;
+  dvrk_data::AppConfig cfg;
   try {
-    cfg = sv::Config::parse_app_config(root);
+    cfg = dvrk_data::Config::parse_app_config(root);
   } catch (const std::exception &e) {
     RCLCPP_ERROR(node->get_logger(), "%s", e.what());
     rclcpp::shutdown();
@@ -1071,7 +948,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  const sv::AppConfig &app_cfg = cfg;
+  const dvrk_data::AppConfig &app_cfg = cfg;
 
   RCLCPP_INFO(node->get_logger(), "stereo gst input: %s",
               cfg.stereo.gst_input.c_str());
@@ -1123,49 +1000,49 @@ int main(int argc, char *argv[]) {
   auto camera_sub = node->create_subscription<sensor_msgs::msg::Joy>(
       camera_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
-        sv::on_camera_joy(msg, overlay_state);
+        dvrk_console::on_camera_joy(msg, overlay_state);
       });
 
   auto clutch_sub = node->create_subscription<sensor_msgs::msg::Joy>(
       clutch_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
-        sv::on_clutch_joy(msg, overlay_state);
+        dvrk_console::on_clutch_joy(msg, overlay_state);
       });
 
   auto focus_minus_sub = node->create_subscription<sensor_msgs::msg::Joy>(
       focus_minus_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
-        sv::on_focus_minus_joy(msg, overlay_state);
+        dvrk_console::on_focus_minus_joy(msg, overlay_state);
       });
 
   auto focus_plus_sub = node->create_subscription<sensor_msgs::msg::Joy>(
       focus_plus_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
-        sv::on_focus_plus_joy(msg, overlay_state);
+        dvrk_console::on_focus_plus_joy(msg, overlay_state);
       });
 
   auto bicoag_sub = node->create_subscription<sensor_msgs::msg::Joy>(
       bicoag_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
-        sv::on_bicoag_joy(msg, overlay_state);
+        dvrk_console::on_bicoag_joy(msg, overlay_state);
       });
 
   auto coag_sub = node->create_subscription<sensor_msgs::msg::Joy>(
       coag_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
-        sv::on_coag_joy(msg, overlay_state);
+        dvrk_console::on_coag_joy(msg, overlay_state);
       });
 
   auto operator_present_sub = node->create_subscription<sensor_msgs::msg::Joy>(
       operator_present_topic, latch_qos,
       [overlay_state](const sensor_msgs::msg::Joy::SharedPtr msg) {
-        sv::on_operator_present(msg, overlay_state);
+        dvrk_console::on_operator_present(msg, overlay_state);
       });
  
   auto ecm_js_sub = node->create_subscription<sensor_msgs::msg::JointState>(
       "/ECM/measured_js", measured_cp_qos,
       [overlay_state](const sensor_msgs::msg::JointState::SharedPtr msg) {
-        sv::on_ecm_measured_js(msg, overlay_state);
+        dvrk_console::on_ecm_measured_js(msg, overlay_state);
       });
 
   auto following_subscribers_cache = std::make_shared<std::unordered_map<
@@ -1194,11 +1071,11 @@ int main(int argc, char *argv[]) {
         }
 
         std::string mtm_name;
-        sv::TeleopSide side;
+        dvrk_console::TeleopSide side;
         int psm_number = 0;
         std::string arm_name;
         bool is_camera_teleop = false;
-        if (!sv::parse_teleop_name(msg->data, mtm_name, side, psm_number,
+        if (!dvrk_console::parse_teleop_name(msg->data, mtm_name, side, psm_number,
                                    &arm_name, &is_camera_teleop)) {
           return;
         }
@@ -1211,7 +1088,7 @@ int main(int argc, char *argv[]) {
           active_teleops->erase(previous_teleop);
           auto previous_msg = std::make_shared<std_msgs::msg::String>();
           previous_msg->data = previous_teleop;
-          sv::on_teleop_unselected(previous_msg, overlay_state);
+          dvrk_console::on_teleop_unselected(previous_msg, overlay_state);
           RCLCPP_INFO(node->get_logger(), "Replacing teleop for %s: %s -> %s",
                       mtm_name.c_str(), previous_teleop.c_str(),
                       teleop_name.c_str());
@@ -1219,7 +1096,7 @@ int main(int argc, char *argv[]) {
         (*latest_teleop_by_mtm)[mtm_name] = teleop_name;
         active_teleops->insert(teleop_name);
 
-        sv::on_teleop_selected(msg, overlay_state);
+        dvrk_console::on_teleop_selected(msg, overlay_state);
 
         if (following_subscribers_cache->find(teleop_name) ==
             following_subscribers_cache->end()) {
@@ -1233,7 +1110,7 @@ int main(int argc, char *argv[]) {
                     active_teleops->end()) {
                   return;
                 }
-                sv::on_teleop_following(teleop_name, following_msg,
+                dvrk_console::on_teleop_following(teleop_name, following_msg,
                                         overlay_state);
               });
 
@@ -1255,7 +1132,7 @@ int main(int argc, char *argv[]) {
                     active_teleops->end()) {
                   return;
                 }
-                sv::on_teleop_scale(teleop_name, scale_msg, overlay_state);
+                dvrk_console::on_teleop_scale(teleop_name, scale_msg, overlay_state);
               });
 
           (*scale_subscribers_cache)[teleop_name] = scale_sub;
@@ -1275,7 +1152,7 @@ int main(int argc, char *argv[]) {
                     active_teleops->end()) {
                   return;
                 }
-                sv::on_teleop_current_state(teleop_name, state_msg,
+                dvrk_console::on_teleop_current_state(teleop_name, state_msg,
                                             overlay_state);
               });
 
@@ -1294,7 +1171,7 @@ int main(int argc, char *argv[]) {
                   [overlay_state,
                    arm_name](const geometry_msgs::msg::PoseStamped::SharedPtr
                                  measured_cp_msg) {
-                    sv::on_teleop_measured_cp(arm_name, measured_cp_msg,
+                    dvrk_console::on_teleop_measured_cp(arm_name, measured_cp_msg,
                                               overlay_state);
                   });
 
@@ -1314,7 +1191,7 @@ int main(int argc, char *argv[]) {
                     tool_type_topic, persistent_event_qos,
                     [overlay_state, psm_name](
                         const std_msgs::msg::String::SharedPtr tool_type_msg) {
-                      sv::on_teleop_tool_type(psm_name, tool_type_msg,
+                      dvrk_console::on_teleop_tool_type(psm_name, tool_type_msg,
                                               overlay_state);
                     });
 
@@ -1335,12 +1212,12 @@ int main(int argc, char *argv[]) {
         }
 
         std::string mtm_name;
-        sv::TeleopSide side;
+        dvrk_console::TeleopSide side;
         int psm_number = 0;
         const bool parsed =
-            sv::parse_teleop_name(msg->data, mtm_name, side, psm_number);
+            dvrk_console::parse_teleop_name(msg->data, mtm_name, side, psm_number);
 
-        sv::on_teleop_unselected(msg, overlay_state);
+        dvrk_console::on_teleop_unselected(msg, overlay_state);
         active_teleops->erase(msg->data);
         RCLCPP_INFO(node->get_logger(),
                     "Teleop inactive (subscriber cached): /%s/following",
@@ -1363,7 +1240,7 @@ int main(int argc, char *argv[]) {
 
   RCLCPP_INFO(node->get_logger(), "GStreamer pipeline string:\n%s", pipeline_string.c_str());
 
-  dc_stereo::PipelineUserData pipeline_user_data;
+  dvrk_console::GstPipelineRuntime pipeline_runtime;
   GError *error = nullptr;
   GstElement *pipeline = gst_parse_launch(pipeline_string.c_str(), &error);
   if (error != nullptr || pipeline == nullptr) {
@@ -1381,12 +1258,13 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  pipeline_user_data.node = node.get();
-  pipeline_user_data.reconnector.start(pipeline, node.get(), "stereo_display");
-
-  GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
-  gst_bus_add_watch(bus, dc_stereo::on_bus_message, &pipeline_user_data);
-  gst_object_unref(bus);
+  if (!pipeline_runtime.start(pipeline, node.get(), "stereo_display")) {
+    RCLCPP_ERROR(node->get_logger(),
+                 "Unable to attach GStreamer runtime to stereo pipeline");
+    gst_object_unref(pipeline);
+    rclcpp::shutdown();
+    return 1;
+  }
 
   FrameTimestampState timestamp_state;
   attach_timestamp_probes(pipeline, cfg, &timestamp_state);
@@ -1404,11 +1282,7 @@ int main(int argc, char *argv[]) {
           gst_bin_get_by_name(GST_BIN(pl), overlay_name.c_str());
       if (overlay == nullptr) continue;
       first_overlay_found = true;
-      g_signal_connect(overlay, "caps-changed",
-                       G_CALLBACK(sv::on_overlay_caps_changed),
-                       overlay_state.get());
-      g_signal_connect(overlay, "draw", G_CALLBACK(sv::on_overlay_draw),
-                       overlay_state.get());
+      dvrk_console::attach_overlay_callbacks(overlay, overlay_state);
       gst_object_unref(overlay);
     }
   };
@@ -1424,7 +1298,7 @@ int main(int argc, char *argv[]) {
   g_app = Gtk::Application::create("org.dvrk.display.stereo." + app_cfg.name, Gio::APPLICATION_NON_UNIQUE);
   g_unix_signal_add(SIGINT, on_sigint, nullptr);
   g_unix_signal_add(SIGTERM, on_sigint, nullptr);
-  g_timeout_add(20, on_ros_spin, node.get());
+  dvrk_console::GlibRosExecutor ros_executor(node);
 
   rclcpp::spin_some(node->get_node_base_interface());
 
@@ -1446,45 +1320,47 @@ int main(int argc, char *argv[]) {
     RCLCPP_INFO(node->get_logger(),
                 "Rebuilding pipeline with pip_gst_inputs.scale=%.2f", new_scale);
 
-    pipeline_user_data.reconnector.stop();
-    // Stop and destroy old pipeline
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(pipeline);
-    pipeline = nullptr;
-
-    // Update scale in config copy (cfg is a local copy in main)
-    cfg.pip_gst_inputs.scale = new_scale;
-
-    // Rebuild pipeline string
+    // Build the replacement first.  Keep the current pipeline alive if
+    // parsing fails, so a bad runtime setting cannot blank the display.
+    dvrk_data::AppConfig candidate_cfg = cfg;
+    candidate_cfg.pip_gst_inputs.scale = new_scale;
     const std::string new_pipeline_str =
-        build_pipeline_string(cfg, overlay_available);
+        build_pipeline_string(candidate_cfg, overlay_available);
 
     GError *rebuild_error = nullptr;
-    pipeline = gst_parse_launch(new_pipeline_str.c_str(), &rebuild_error);
-    if (rebuild_error != nullptr || pipeline == nullptr) {
+    GstElement *new_pipeline =
+        gst_parse_launch(new_pipeline_str.c_str(), &rebuild_error);
+    if (rebuild_error != nullptr || new_pipeline == nullptr) {
       RCLCPP_ERROR(node->get_logger(),
                    "Failed to rebuild pipeline after scale change: %s",
                    rebuild_error ? rebuild_error->message : "unknown");
       if (rebuild_error) g_error_free(rebuild_error);
-      if (pipeline) { gst_object_unref(pipeline); pipeline = nullptr; }
+      if (new_pipeline) { gst_object_unref(new_pipeline); }
       return;
     }
 
-    // Re-attach bus watcher
-    pipeline_user_data.reconnector.start(pipeline, node.get(), "stereo_display");
-    GstBus *new_bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
-    gst_bus_add_watch(new_bus, dc_stereo::on_bus_message, &pipeline_user_data);
-    gst_object_unref(new_bus);
-
     // Re-attach overlay signals
-    attach_overlays(pipeline);
-    attach_timestamp_probes(pipeline, cfg, &timestamp_state);
-    attach_ar_timestamp_probes(pipeline);
+    attach_overlays(new_pipeline);
+    attach_timestamp_probes(new_pipeline, candidate_cfg, &timestamp_state);
+    attach_ar_timestamp_probes(new_pipeline);
+
+    // Commit the swap only after the replacement has been parsed and wired.
+    pipeline_runtime.stop();
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    pipeline = new_pipeline;
+    cfg = candidate_cfg;
+
+    if (!pipeline_runtime.start(pipeline, node.get(), "stereo_display")) {
+      RCLCPP_ERROR(node->get_logger(),
+                   "Unable to attach GStreamer runtime after pipeline rebuild");
+    }
 
     // Refresh display windows in the control window
     control_window_ptr->setup_display_windows(pipeline);
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    pipeline_string = new_pipeline_str;
     RCLCPP_INFO(node->get_logger(), "Pipeline restarted with new scale");
   };
 
@@ -1503,7 +1379,7 @@ int main(int argc, char *argv[]) {
   RCLCPP_INFO(node->get_logger(), "Stereo display pipeline on quit: %s",
               pipeline_string.c_str());
 
-  pipeline_user_data.reconnector.stop();
+  pipeline_runtime.stop();
 
   if (pipeline) {
     gst_element_send_event(pipeline, gst_event_new_eos());

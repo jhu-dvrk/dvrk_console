@@ -40,6 +40,8 @@
 #include <dvrk_data/dvrk_gst_socket.hpp>
 #include <dvrk_data/stereo_common.hpp>
 #include <dvrk_data/window_monitor_manager.hpp>
+#include "glib_ros_executor.hpp"
+#include "gst_pipeline_runtime.hpp"
 
 // Configuration and State structures
 struct ArmStatus {
@@ -127,7 +129,7 @@ std::vector<XInputPointerDevice> enumerate_xinput_pointer_devices() {
 }
 
 bool looks_like_touchscreen(const XInputPointerDevice& device) {
-    if (device.has_touch_class || device.has_absolute_valuator) {
+    if (device.has_touch_class) {
         return true;
     }
 
@@ -137,9 +139,6 @@ bool looks_like_touchscreen(const XInputPointerDevice& device) {
     return name.find("touch") != std::string::npos ||
            name.find("digitizer") != std::string::npos ||
            name.find("digitiser") != std::string::npos ||
-           name.find("tablet") != std::string::npos ||
-           name.find("stylus") != std::string::npos ||
-           name.find("pen") != std::string::npos ||
            name.find("egalax") != std::string::npos ||
            name.find("ilitek") != std::string::npos ||
            name.find("goodix") != std::string::npos ||
@@ -285,7 +284,7 @@ bool load_control_panel_config(const std::string& path, ControlPanelConfig& conf
     }
 
     Json::Value root;
-    if (!sv::Config::load_from_file(path, root)) {
+    if (!dvrk_data::Config::load_from_file(path, root)) {
         return false;
     }
     if (!root.isObject()) {
@@ -362,7 +361,7 @@ public:
         set_title("dVRK Control Panel");
         set_default_size(1024, 600);
 
-        m_monitor_manager = std::make_unique<sv::WindowMonitorManager>(*this, m_settings_name, "control_panel");
+        m_monitor_manager = std::make_unique<dvrk_data::WindowMonitorManager>(*this, m_settings_name, "control_panel");
         load_persisted_display_settings();
         load_persisted_user_settings();
 
@@ -437,6 +436,9 @@ public:
             m_monitor_poll_connection.disconnect();
         }
 
+        // Coordinate Transformation Matrix is a process-global XInput
+        // property; do not leave the desktop remapped after the panel exits.
+        reset_touchscreen_settings();
         close_video_source();
     }
 
@@ -817,7 +819,7 @@ private:
     }
 
     void close_video_source() {
-        m_video_user_data.reconnector.stop();
+        m_video_runtime.stop();
 
         if (m_current_video_widget) {
             m_video_area.remove(*m_current_video_widget);
@@ -877,12 +879,11 @@ private:
         mm_widget->show();
         g_object_unref(gtk_widget); // decrement reference returned by g_object_get
 
-        m_video_user_data.node = m_node.get();
-        m_video_user_data.reconnector.start(pipeline, m_node.get(), "control_panel_video");
-
-        GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
-        gst_bus_add_watch(bus, dc_stereo::on_bus_message, &m_video_user_data);
-        gst_object_unref(bus);
+        if (!m_video_runtime.start(pipeline, m_node.get(),
+                                   "control_panel_video")) {
+            gst_object_unref(pipeline);
+            return false;
+        }
 
         gst_element_set_state(pipeline, GST_STATE_PLAYING);
         m_current_video_widget = mm_widget;
@@ -1662,6 +1663,9 @@ private:
     }
 
     void set_touchscreen_device(const std::string& device_name) {
+        if (device_name != m_touchscreen_device_name) {
+            reset_touchscreen_settings();
+        }
         m_touchscreen_device_name = device_name;
         m_last_touchscreen_apply_monitor_index = -1;
         save_persisted_user_settings();
@@ -1685,8 +1689,35 @@ private:
         if (enabled) {
             apply_touchscreen_settings_for_monitor(monitor_index, true);
         } else {
+            reset_touchscreen_settings();
             m_last_touchscreen_apply_monitor_index = -1;
         }
+    }
+
+    void reset_touchscreen_settings() {
+        if (m_last_touchscreen_device_id < 0) {
+            return;
+        }
+
+        Display* display = XOpenDisplay(nullptr);
+        if (!display) {
+            return;
+        }
+
+        const float identity[9] = {
+            1.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 1.0f};
+        const Atom property = XInternAtom(
+            display, "Coordinate Transformation Matrix", False);
+        const Atom float_type = XInternAtom(display, "FLOAT", False);
+        XIChangeProperty(display, m_last_touchscreen_device_id, property,
+                         float_type, 32, XIPropModeReplace,
+                         reinterpret_cast<unsigned char*>(
+                             const_cast<float*>(identity)), 9);
+        XSync(display, False);
+        XCloseDisplay(display);
+        m_last_touchscreen_device_id = -1;
     }
 
     void quit_application() {
@@ -1790,6 +1821,7 @@ private:
                   << " using '" << selected_device->name << "' (id="
                   << selected_device->id << ")" << std::endl;
         m_last_touchscreen_apply_monitor_index = monitor_index;
+        m_last_touchscreen_device_id = selected_device->id;
     }
 
     bool monitor_geometry(int monitor_index, Gdk::Rectangle& geometry) const {
@@ -2041,7 +2073,7 @@ private:
     Gtk::Widget* m_current_video_widget = nullptr;
     std::string m_current_video_path;
     std::string m_persisted_video_path;
-    dc_stereo::PipelineUserData m_video_user_data;
+    dvrk_console::GstPipelineRuntime m_video_runtime;
 
     // Asynchronous resets
     std::unordered_map<std::string, ResetState> m_active_resets;
@@ -2074,7 +2106,8 @@ private:
     std::unordered_map<int, bool> m_touchscreen_by_monitor;
     std::string m_touchscreen_device_name;
     int m_last_touchscreen_apply_monitor_index = -1;
-    std::unique_ptr<sv::WindowMonitorManager> m_monitor_manager;
+    int m_last_touchscreen_device_id = -1;
+    std::unique_ptr<dvrk_data::WindowMonitorManager> m_monitor_manager;
 
     // Colors
     Gdk::RGBA m_color_green;
@@ -2147,14 +2180,7 @@ int main(int argc, char* argv[]) {
     ControlPanelWindow window(node, config.name, config.console, video_sources);
 
     // Wire up ROS2 spin with GLib main loop (every 20ms)
-    guint ros_spin_source = g_timeout_add(20, [](gpointer data) -> gboolean {
-        auto* n = static_cast<rclcpp::Node*>(data);
-        if (rclcpp::ok()) {
-            rclcpp::spin_some(n->get_node_base_interface());
-            return TRUE;
-        }
-        return FALSE;
-    }, node.get());
+    dvrk_console::GlibRosExecutor ros_executor(node);
 
     // Gracefully handle termination signals to quit Gtk main loop
     g_unix_signal_add(SIGINT, [](gpointer data) -> gboolean {
@@ -2175,7 +2201,6 @@ int main(int argc, char* argv[]) {
 
     // Run GTK application
     int status = app->run(window);
-    g_source_remove(ros_spin_source);
 
     // Shutdown ROS2
     rclcpp::shutdown();

@@ -3,7 +3,7 @@
 #include <cmath>
 #include <algorithm>
 
-namespace sv {
+namespace dvrk_console {
 
 namespace {
 
@@ -344,4 +344,4 @@ void draw_operator_present_icon(cairo_t *cr, int status, double cx, double cy,
   cairo_show_text(cr, "OP");
 }
 
-} // namespace sv
+} // namespace dvrk_console

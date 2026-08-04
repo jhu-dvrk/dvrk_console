@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace sv {
+namespace dvrk_console {
 
 void set_source_rgba(cairo_t *cr, const RgbaColor &color, double alpha) {
   cairo_set_source_rgba(cr, color.r, color.g, color.b, alpha * color.a_mult);
@@ -65,4 +65,4 @@ std::string format_tool_type_label(const std::string &raw_tool_type) {
   return formatted;
 }
 
-} // namespace sv
+} // namespace dvrk_console

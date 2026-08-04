@@ -1,7 +1,7 @@
 #ifndef SV_OVERLAY_THEME_HPP
 #define SV_OVERLAY_THEME_HPP
 
-namespace sv {
+namespace dvrk_console {
 
 struct RgbaColor {
   double r, g, b, a_mult;
@@ -49,6 +49,6 @@ struct OverlayTheme {
   }
 };
 
-} // namespace sv
+} // namespace dvrk_console
 
 #endif // SV_OVERLAY_THEME_HPP

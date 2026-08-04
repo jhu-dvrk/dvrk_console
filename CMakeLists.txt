@@ -12,6 +12,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(crtk_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(dvrk_data REQUIRED)
@@ -28,6 +29,33 @@ add_library(dvrk_console_overlay
   src/dvrk_console/overlay_utils.cpp
   src/dvrk_console/overlay_components.cpp
 )
+
+add_library(dvrk_console_ui
+  src/dvrk_console/display_output_panel.cpp
+)
+target_include_directories(dvrk_console_ui PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dvrk_console
+  ${GTKMM_INCLUDE_DIRS}
+)
+target_compile_options(dvrk_console_ui PRIVATE
+  ${GTKMM_CFLAGS_OTHER}
+)
+ament_target_dependencies(dvrk_console_ui dvrk_data)
+target_link_libraries(dvrk_console_ui ${GTKMM_LIBRARIES})
+
+add_library(dvrk_console_runtime
+  src/dvrk_console/glib_ros_executor.cpp
+  src/dvrk_console/gst_pipeline_runtime.cpp
+)
+target_include_directories(dvrk_console_runtime PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dvrk_console
+  ${GST_INCLUDE_DIRS}
+)
+target_compile_options(dvrk_console_runtime PRIVATE
+  ${GST_CFLAGS_OTHER}
+)
+ament_target_dependencies(dvrk_console_runtime rclcpp dvrk_data)
+target_link_libraries(dvrk_console_runtime ${GST_LIBRARIES})
 target_include_directories(dvrk_console_overlay PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dvrk_console
   ${GST_INCLUDE_DIRS}
@@ -43,6 +71,7 @@ target_compile_options(dvrk_console_overlay PRIVATE
 )
 ament_target_dependencies(dvrk_console_overlay
   rclcpp
+  geometry_msgs
   sensor_msgs
   std_msgs
 )
@@ -60,14 +89,12 @@ add_executable(control_panel
   src/dvrk_console/main_control_panel.cpp
 )
 
+ament_target_dependencies(stereo_display
+  rclcpp geometry_msgs sensor_msgs std_msgs dvrk_data)
+ament_target_dependencies(control_panel
+  rclcpp crtk_msgs std_msgs dvrk_data)
+
 foreach(exe stereo_display control_panel)
-  ament_target_dependencies(${exe}
-    rclcpp
-    sensor_msgs
-    std_msgs
-    crtk_msgs
-    dvrk_data
-  )
   target_include_directories(${exe} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dvrk_console
     ${GST_INCLUDE_DIRS}
@@ -86,9 +113,12 @@ foreach(exe stereo_display control_panel)
     ${JSONCPP_LIBRARIES}
     ${CAIRO_LIBRARIES}
     ${GTKMM_LIBRARIES}
-    dvrk_console_overlay
   )
 endforeach()
+
+target_link_libraries(stereo_display
+  dvrk_console_overlay dvrk_console_ui dvrk_console_runtime)
+target_link_libraries(control_panel dvrk_console_runtime)
 
 target_include_directories(control_panel PRIVATE ${X11_INCLUDE_DIRS})
 target_compile_options(control_panel PRIVATE ${X11_CFLAGS_OTHER})

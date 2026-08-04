@@ -3,6 +3,8 @@
 #include "overlay_theme.hpp"
 #include "overlay_utils.hpp"
 
+#include <cairo/cairo.h>
+#include <gst/gst.h>
 #include <gst/video/video.h>
 
 #include <algorithm>
@@ -14,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace sv {
+namespace dvrk_console {
 
 namespace {
 
@@ -770,4 +772,16 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   }
 }
 
-} // namespace sv
+void attach_overlay_callbacks(
+    GstElement *overlay, const std::shared_ptr<OverlayState> &overlay_state) {
+  if (overlay == nullptr || !overlay_state) {
+    return;
+  }
+
+  g_signal_connect(overlay, "caps-changed",
+                   G_CALLBACK(on_overlay_caps_changed), overlay_state.get());
+  g_signal_connect(overlay, "draw", G_CALLBACK(on_overlay_draw),
+                   overlay_state.get());
+}
+
+} // namespace dvrk_console

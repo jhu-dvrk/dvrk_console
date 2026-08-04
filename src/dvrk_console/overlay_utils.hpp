@@ -5,7 +5,7 @@
 #include <cairo/cairo.h>
 #include <string>
 
-namespace sv {
+namespace dvrk_console {
 
 void set_source_rgba(cairo_t *cr, const RgbaColor &color, double alpha);
 
@@ -14,6 +14,6 @@ void draw_rounded_rectangle(cairo_t *cr, double x, double y, double width,
 
 std::string format_tool_type_label(const std::string &raw_tool_type);
 
-} // namespace sv
+} // namespace dvrk_console
 
 #endif // SV_OVERLAY_UTILS_HPP

@@ -5,7 +5,7 @@
 #include <cairo/cairo.h>
 #include <string>
 
-namespace sv {
+namespace dvrk_console {
 
 void draw_status_circle(cairo_t *cr, int status, double cx, double cy,
                         double radius, double alpha, const OverlayTheme &theme);
@@ -39,6 +39,6 @@ void draw_operator_present_icon(cairo_t *cr, int status, double cx, double cy,
                                 double radius, double alpha,
                                 const OverlayTheme &theme);
 
-} // namespace sv
+} // namespace dvrk_console
 
 #endif // SV_OVERLAY_COMPONENTS_HPP
