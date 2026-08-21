@@ -58,7 +58,9 @@ struct FrameTimestampState {
 
 void print_usage(const char *executable) {
   std::cerr << "Usage: " << executable
-            << " -c <config.json> [--grid]" << std::endl;
+            << " [-c <config.json>] [--grid]" << std::endl;
+  std::cerr << "  -c       Configuration file (defaults to ./stereo_display.json)"
+            << std::endl;
   std::cerr << "  --grid   Display calibration grid overlay for display alignment"
             << std::endl;
 }
@@ -93,8 +95,16 @@ bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
   }
 
   if (!seen_config) {
-    std::cerr << "Error: exactly one config file is required." << std::endl;
-    return false;
+    const std::filesystem::path default_config = "stereo_display.json";
+    if (std::filesystem::is_regular_file(default_config)) {
+      options.config_file = default_config.string();
+      std::cerr << "Using default stereo display config: "
+                << options.config_file << std::endl;
+    } else {
+      std::cerr << "Error: no -c config was provided and ./"
+                << default_config.string() << " was not found." << std::endl;
+      return false;
+    }
   }
 
   return true;
