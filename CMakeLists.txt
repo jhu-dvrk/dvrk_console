@@ -40,7 +40,7 @@ target_include_directories(dvrk_console_ui PRIVATE
 target_compile_options(dvrk_console_ui PRIVATE
   ${GTKMM_CFLAGS_OTHER}
 )
-ament_target_dependencies(dvrk_console_ui dvrk_data)
+target_link_libraries(dvrk_console_ui dvrk_data::dvrk_data)
 target_link_libraries(dvrk_console_ui ${GTKMM_LIBRARIES})
 
 add_library(dvrk_console_runtime
@@ -54,7 +54,10 @@ target_include_directories(dvrk_console_runtime PRIVATE
 target_compile_options(dvrk_console_runtime PRIVATE
   ${GST_CFLAGS_OTHER}
 )
-ament_target_dependencies(dvrk_console_runtime rclcpp dvrk_data)
+target_link_libraries(dvrk_console_runtime
+  rclcpp::rclcpp
+  dvrk_data::dvrk_data
+)
 target_link_libraries(dvrk_console_runtime ${GST_LIBRARIES})
 target_include_directories(dvrk_console_overlay PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dvrk_console
@@ -69,11 +72,11 @@ target_compile_options(dvrk_console_overlay PRIVATE
   ${CAIRO_CFLAGS_OTHER}
   ${GTKMM_CFLAGS_OTHER}
 )
-ament_target_dependencies(dvrk_console_overlay
-  rclcpp
-  geometry_msgs
-  sensor_msgs
-  std_msgs
+target_link_libraries(dvrk_console_overlay
+  rclcpp::rclcpp
+  geometry_msgs::geometry_msgs
+  sensor_msgs::sensor_msgs
+  std_msgs::std_msgs
 )
 target_link_libraries(dvrk_console_overlay
   ${GST_LIBRARIES}
@@ -89,10 +92,19 @@ add_executable(control_panel
   src/dvrk_console/main_control_panel.cpp
 )
 
-ament_target_dependencies(stereo_display
-  rclcpp geometry_msgs sensor_msgs std_msgs dvrk_data)
-ament_target_dependencies(control_panel
-  rclcpp crtk_msgs std_msgs dvrk_data)
+target_link_libraries(stereo_display
+  rclcpp::rclcpp
+  geometry_msgs::geometry_msgs
+  sensor_msgs::sensor_msgs
+  std_msgs::std_msgs
+  dvrk_data::dvrk_data
+)
+target_link_libraries(control_panel
+  rclcpp::rclcpp
+  ${crtk_msgs_TARGETS}
+  std_msgs::std_msgs
+  dvrk_data::dvrk_data
+)
 
 foreach(exe stereo_display control_panel)
   target_include_directories(${exe} PRIVATE
