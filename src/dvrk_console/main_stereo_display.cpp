@@ -1310,7 +1310,7 @@ int main(int argc, char *argv[]) {
   g_unix_signal_add(SIGTERM, on_sigint, nullptr);
   dvrk_console::GlibRosExecutor ros_executor(node);
 
-  rclcpp::spin_some(node->get_node_base_interface());
+  ros_executor.spin_some();
 
   (void)camera_sub;
   (void)clutch_sub;

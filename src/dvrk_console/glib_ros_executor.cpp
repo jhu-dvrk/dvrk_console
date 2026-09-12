@@ -4,11 +4,18 @@ namespace dvrk_console {
 
 GlibRosExecutor::GlibRosExecutor(const std::shared_ptr<rclcpp::Node> &node,
                                  guint interval_ms)
-    : m_node(node),
-      m_source_id(g_timeout_add(interval_ms, &GlibRosExecutor::on_tick, this)) {}
+    : m_node(node) {
+  m_executor.add_node(m_node);
+  m_source_id = g_timeout_add(interval_ms, &GlibRosExecutor::on_tick, this);
+}
 
 GlibRosExecutor::~GlibRosExecutor() {
   stop();
+  m_executor.remove_node(m_node);
+}
+
+void GlibRosExecutor::spin_some() {
+  m_executor.spin_some();
 }
 
 void GlibRosExecutor::stop() {
@@ -27,7 +34,7 @@ gboolean GlibRosExecutor::on_tick(gpointer user_data) {
     return G_SOURCE_REMOVE;
   }
 
-  rclcpp::spin_some(self->m_node->get_node_base_interface());
+  self->spin_some();
   return G_SOURCE_CONTINUE;
 }
 

@@ -17,12 +17,14 @@ public:
   GlibRosExecutor(const GlibRosExecutor &) = delete;
   GlibRosExecutor &operator=(const GlibRosExecutor &) = delete;
 
+  void spin_some();
   void stop();
 
 private:
   static gboolean on_tick(gpointer user_data);
 
   std::shared_ptr<rclcpp::Node> m_node;
+  rclcpp::executors::SingleThreadedExecutor m_executor;
   guint m_source_id = 0;
 };
 
