@@ -63,6 +63,9 @@ void print_usage(const char *executable) {
             << std::endl;
   std::cerr << "  --grid   Display calibration grid overlay for display alignment"
             << std::endl;
+  std::cerr << "  ROS parameters: ecm_roll_min_degrees (default -90), "
+               "ecm_roll_max_degrees (default 90) set roll warning limits"
+            << std::endl;
 }
 
 bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
@@ -840,6 +843,17 @@ int main(int argc, char *argv[]) {
 
   auto node = std::make_shared<rclcpp::Node>("dvrk_console");
   auto overlay_state = std::make_shared<dvrk_console::OverlayState>();
+  const double roll_min = node->declare_parameter("ecm_roll_min_degrees", -90.0);
+  const double roll_max = node->declare_parameter("ecm_roll_max_degrees", 90.0);
+  if (!std::isfinite(roll_min) || !std::isfinite(roll_max)
+      || roll_min >= 0.0 || roll_max <= 0.0) {
+    RCLCPP_ERROR(node->get_logger(),
+                 "ECM roll limits must be finite with min < 0 < max");
+    rclcpp::shutdown();
+    return 1;
+  }
+  overlay_state->camera_roll.lower_limit = roll_min * M_PI / 180.0;
+  overlay_state->camera_roll.upper_limit = roll_max * M_PI / 180.0;
 
   std::string console_name = "console";
 
@@ -1053,6 +1067,12 @@ int main(int argc, char *argv[]) {
       "/ECM/measured_js", measured_cp_qos,
       [overlay_state](const sensor_msgs::msg::JointState::SharedPtr msg) {
         dvrk_console::on_ecm_measured_js(msg, overlay_state);
+      });
+
+  auto ecm_gravity_sub = node->create_subscription<geometry_msgs::msg::Vector3Stamped>(
+      "/ECM/gravity_direction", measured_cp_qos,
+      [overlay_state](const geometry_msgs::msg::Vector3Stamped::SharedPtr msg) {
+        dvrk_console::on_ecm_gravity_direction(msg, overlay_state);
       });
 
   auto following_subscribers_cache = std::make_shared<std::unordered_map<

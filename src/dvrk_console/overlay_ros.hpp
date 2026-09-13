@@ -4,6 +4,7 @@
 #include "overlay_state.hpp"
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -73,6 +74,9 @@ void on_operator_present(
     const std::shared_ptr<OverlayState> &overlay_state);
 void on_ecm_measured_js(
     const sensor_msgs::msg::JointState::SharedPtr msg,
+    const std::shared_ptr<OverlayState> &overlay_state);
+void on_ecm_gravity_direction(
+    const geometry_msgs::msg::Vector3Stamped::SharedPtr msg,
     const std::shared_ptr<OverlayState> &overlay_state);
 
 }  // namespace dvrk_console

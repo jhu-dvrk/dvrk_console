@@ -340,11 +340,41 @@ void on_ecm_measured_js(const sensor_msgs::msg::JointState::SharedPtr msg,
   if (msg == nullptr) {
     return;
   }
-  if (msg->position.size() < 4) {
+  std::scoped_lock<std::mutex> lock(overlay_state->mutex);
+  auto &roll = overlay_state->camera_roll;
+  if (msg->position.size() < 4 || !std::isfinite(msg->position[3])
+      || (msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0)) {
+    roll.valid = false;
     return;
   }
+  roll.angle = msg->position[3];
+  roll.valid = true;
+  roll.received = std::chrono::steady_clock::now();
+}
+
+void on_ecm_gravity_direction(
+    const geometry_msgs::msg::Vector3Stamped::SharedPtr msg,
+    const std::shared_ptr<OverlayState> &overlay_state) {
+  if (!msg) return;
   std::scoped_lock<std::mutex> lock(overlay_state->mutex);
-  overlay_state->camera_roll = msg->position[3];
+  auto &gravity = overlay_state->camera_gravity;
+  const auto &v = msg->vector;
+  const double norm = std::hypot(v.x, v.y, v.z);
+  const int64_t stamp = static_cast<int64_t>(msg->header.stamp.sec) * 1000000000LL
+                        + msg->header.stamp.nanosec;
+  // ECM reports unavailable gravity as a zero vector. Never turn missing
+  // or malformed data into the center dot used for a vertical view.
+  if (stamp == 0 || msg->header.frame_id != "ECM"
+      || !std::isfinite(norm) || std::abs(norm - 1.0) > 0.01) {
+    gravity.valid = false;
+    return;
+  }
+  if (!gravity.valid || stamp != gravity.timestamp_ns) {
+    gravity.received = std::chrono::steady_clock::now();
+  }
+  gravity.timestamp_ns = stamp;
+  gravity.direction = {{v.x / norm, v.y / norm, v.z / norm}};
+  gravity.valid = true;
 }
 
 void on_overlay_caps_changed(GstElement *overlay, GstCaps *caps,
@@ -396,7 +426,8 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   int display_horizontal_offset_px = 0;
   bool show_eye_labels = false;
   bool show_grid = false;
-  double camera_roll = 0.0;
+  RollIndicator camera_roll;
+  GravityIndicator camera_gravity;
   std::unordered_map<std::string, ArmOverlayInfo> arm_info;
   std::vector<TeleopIndicator> left_teleops;
   std::vector<TeleopIndicator> right_teleops;
@@ -442,6 +473,7 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
     show_eye_labels = overlay_state->show_eye_labels;
     show_grid = overlay_state->show_grid;
     camera_roll = overlay_state->camera_roll;
+    camera_gravity = overlay_state->camera_gravity;
     arm_info = overlay_state->arm_info;
 
     for (const auto &pair : overlay_state->teleop_indicators) {
@@ -644,7 +676,8 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
     }
 
     auto draw_top_icons = [&](const double cx) {
-      const double icon_height = theme.radius * 1.6;
+      const double top_radius = theme.radius * 1.5;
+      const double icon_height = top_radius * 1.6;
       const double cy_top = theme.v_spacing + icon_height * 0.5;
       const double body_width = icon_height * (5.0 / 3.0);
       // Offset from center to achieve h_spacing between rectangular icons
@@ -671,16 +704,16 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
 
       if (show_op && show_cam) {
         draw_operator_present_icon(cr, operator_present_status, cx - top_offset,
-                                   cy_top, theme.radius, overlay_alpha, theme);
+                                   cy_top, top_radius, overlay_alpha, theme);
         draw_camera_icon(cr, camera_teleop.following_active, camera_valid,
-                         cx + top_offset, cy_top, theme.radius, overlay_alpha,
-                         camera_roll, theme);
+                         cx + top_offset, cy_top, top_radius, overlay_alpha,
+                         camera_roll, camera_gravity, theme);
       } else if (show_op) {
         draw_operator_present_icon(cr, operator_present_status, cx, cy_top,
-                                   theme.radius, overlay_alpha, theme);
+                                   top_radius, overlay_alpha, theme);
       } else if (show_cam) {
         draw_camera_icon(cr, camera_teleop.following_active, camera_valid, cx,
-                         cy_top, theme.radius, overlay_alpha, camera_roll,
+                         cy_top, top_radius, overlay_alpha, camera_roll, camera_gravity,
                          theme);
       }
     };

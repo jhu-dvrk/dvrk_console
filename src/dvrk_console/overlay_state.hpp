@@ -2,6 +2,8 @@
 #define DVRK_DISPLAY_OVERLAY_STATE_HPP
 
 #include <chrono>
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -44,6 +46,31 @@ struct ArmOverlayInfo {
   std::string tool_type;
 };
 
+struct RollIndicator {
+  double angle = 0.0;
+  double lower_limit = -1.5707963267948966;
+  double upper_limit = 1.5707963267948966;
+  bool valid = false;
+  std::chrono::steady_clock::time_point received;
+
+  bool is_fresh() const {
+    return valid && std::chrono::steady_clock::now() - received
+                        < std::chrono::milliseconds(500);
+  }
+};
+
+struct GravityIndicator {
+  std::array<double, 3> direction{{0.0, 0.0, 0.0}};
+  bool valid = false;
+  int64_t timestamp_ns = 0;
+  std::chrono::steady_clock::time_point received;
+
+  bool is_fresh() const {
+    return valid && std::chrono::steady_clock::now() - received
+                        < std::chrono::milliseconds(500);
+  }
+};
+
 struct OverlayState {
   ButtonState camera;
   ButtonState clutch;
@@ -62,7 +89,8 @@ struct OverlayState {
   int display_horizontal_offset_px = 0;
   std::unordered_map<std::string, std::pair<int, int>>
       overlay_frame_size_by_name;
-  double camera_roll = 0.0;
+  RollIndicator camera_roll;
+  GravityIndicator camera_gravity;
   std::unordered_map<std::string, TeleopIndicator> teleop_indicators;
   std::unordered_map<std::string, ArmOverlayInfo> arm_info;
   std::mutex mutex;

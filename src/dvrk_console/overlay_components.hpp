@@ -2,6 +2,7 @@
 #define SV_OVERLAY_COMPONENTS_HPP
 
 #include "overlay_theme.hpp"
+#include "overlay_state.hpp"
 #include <cairo/cairo.h>
 #include <string>
 
@@ -32,7 +33,8 @@ void draw_scale_label(cairo_t *cr, const std::string &state, bool left_side,
                       double extra_offset, const OverlayTheme &theme);
 
 void draw_camera_icon(cairo_t *cr, bool active, bool valid, double cx, double cy,
-                      double radius, double alpha, double roll,
+                      double radius, double alpha, const RollIndicator &roll,
+                      const GravityIndicator &gravity,
                       const OverlayTheme &theme);
 
 void draw_operator_present_icon(cairo_t *cr, int status, double cx, double cy,

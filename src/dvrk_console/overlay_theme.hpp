@@ -12,6 +12,10 @@ struct OverlayTheme {
   static constexpr RgbaColor active_green = {0.2, 0.8, 0.2, 1.0};
   static constexpr RgbaColor active_grey = {0.75, 0.75, 0.75, 1.0};
   static constexpr RgbaColor valid_grey = {0.82, 0.82, 0.82, 1.0};
+  static constexpr RgbaColor gravity_blue = {0.3, 0.75, 1.0, 1.0};
+  static constexpr RgbaColor gravity_amber = {1.0, 0.7, 0.2, 1.0};
+  static constexpr RgbaColor roll_limit_dim = {0.4, 0.4, 0.4, 1.0};
+  static constexpr RgbaColor roll_limit_amber = {1.0, 0.7, 0.2, 1.0};
   static constexpr RgbaColor invalid_red = {0.9, 0.15, 0.15, 1.0};
   static constexpr RgbaColor text_light = {0.95, 0.95, 0.95, 1.0};
   static constexpr RgbaColor text_dark = {0.1, 0.1, 0.1, 1.0};

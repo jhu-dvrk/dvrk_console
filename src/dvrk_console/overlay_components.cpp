@@ -2,6 +2,8 @@
 #include "overlay_utils.hpp"
 #include <cmath>
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 
 namespace dvrk_console {
 
@@ -245,7 +247,8 @@ void draw_scale_label(cairo_t *cr, const std::string &state, bool left_side,
 }
 
 void draw_camera_icon(cairo_t *cr, bool active, bool valid, double cx, double cy,
-                      double radius, double alpha, double roll,
+                      double radius, double alpha, const RollIndicator &roll,
+                      const GravityIndicator &gravity,
                       const OverlayTheme &theme) {
   const RgbaColor outline_color =
       valid ? theme.valid_grey : theme.invalid_red;
@@ -291,16 +294,96 @@ void draw_camera_icon(cairo_t *cr, bool active, bool valid, double cx, double cy
   cairo_set_line_width(cr, theme.line_width);
   cairo_stroke(cr);
 
-  // Draw horizon bar inside the circle
-  cairo_save(cr);
-  cairo_translate(cr, cx, cy);
-  cairo_rotate(cr, -roll); // Negative because if camera rolls right, horizon tilts left
-  cairo_move_to(cr, -circle_radius * 0.8, 0);
-  cairo_line_to(cr, circle_radius * 0.8, 0);
-  set_source_rgba(cr, outline_color, alpha);
-  cairo_set_line_width(cr, theme.line_width);
-  cairo_stroke(cr);
-  cairo_restore(cr);
+  // Static side marks distinguish the two ends of the otherwise symmetric
+  // roll bar. Warnings follow distance to the configured limits.
+  const bool roll_fresh = valid && roll.is_fresh();
+  const double lower_margin = (roll.angle - roll.lower_limit) * 180.0 / M_PI;
+  const double upper_margin = (roll.upper_limit - roll.angle) * 180.0 / M_PI;
+  const auto limit_color = [&](double margin) {
+    if (!roll_fresh || margin >= 20.0) return theme.roll_limit_dim;
+    if (margin <= 5.0) return theme.invalid_red;
+    const double blend = (20.0 - margin) / 15.0;
+    const auto &dim = theme.roll_limit_dim;
+    const auto &amber = theme.roll_limit_amber;
+    return RgbaColor{dim.r + blend * (amber.r - dim.r),
+                     dim.g + blend * (amber.g - dim.g),
+                     dim.b + blend * (amber.b - dim.b), 1.0};
+  };
+  const auto draw_limit = [&](double side, double limit, double margin) {
+    cairo_save(cr);
+    set_source_rgba(cr, limit_color(margin), alpha);
+    cairo_set_line_width(cr, theme.line_width * 1.5);
+    cairo_move_to(cr, cx + side * circle_radius * 0.9, cy);
+    cairo_line_to(cr, cx + side * circle_radius * 1.15, cy);
+    cairo_stroke(cr);
+
+    std::ostringstream label;
+    label << std::showpos << std::fixed << std::setprecision(0)
+          << limit * 180.0 / M_PI << "°";
+    const std::string text = label.str();
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    double font_size = radius * 0.4;
+    cairo_set_font_size(cr, font_size);
+    cairo_text_extents_t extents;
+    cairo_text_extents(cr, text.c_str(), &extents);
+    const double label_width = body_width * 0.5 - circle_radius - theme.line_width;
+    if (extents.width > label_width && label_width > 0.0) {
+      font_size *= label_width / extents.width;
+      cairo_set_font_size(cr, font_size);
+      cairo_text_extents(cr, text.c_str(), &extents);
+    }
+    const double label_cx = cx + side * (circle_radius + body_width * 0.5) * 0.5;
+    cairo_move_to(cr, label_cx - extents.width * 0.5 - extents.x_bearing,
+                  cy - theme.line_width * 2.0);
+    cairo_show_text(cr, text.c_str());
+    cairo_restore(cr);
+  };
+  draw_limit(-1.0, roll.lower_limit, lower_margin);
+  draw_limit(1.0, roll.upper_limit, upper_margin);
+
+  // Draw horizon bar inside the circle; red within 5 degrees of either limit.
+  if (roll_fresh) {
+    cairo_save(cr);
+    cairo_translate(cr, cx, cy);
+    cairo_rotate(cr, -roll.angle); // Camera rolls right, horizon tilts left
+    cairo_move_to(cr, -circle_radius * 0.8, 0);
+    cairo_line_to(cr, circle_radius * 0.8, 0);
+    set_source_rgba(cr, std::min(lower_margin, upper_margin) <= 5.0
+                           ? theme.invalid_red : outline_color, alpha);
+    cairo_set_line_width(cr, theme.line_width);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+  }
+
+  if (valid && gravity.is_fresh()) {
+    // ECM lens axes are X left and Y up; Cairo axes are right and down.
+    // Square the projected magnitude for display: half radius at 45 degrees,
+    // full radius for horizontal viewing, zero for vertical viewing. Scaling
+    // both components preserves direction without dividing near zero.
+    // Don't rotate by roll again: the lens-frame vector already includes roll.
+    const double projection = std::clamp(
+        std::hypot(gravity.direction[0], gravity.direction[1]), 0.0, 1.0);
+    // Blue for gravity in the image plane, amber along its normal. Use the
+    // magnitude so looking straight up and down both produce an amber dot.
+    const double normal = std::clamp(std::abs(gravity.direction[2]), 0.0, 1.0);
+    const auto &in_plane = theme.gravity_blue;
+    const auto &along_normal = theme.gravity_amber;
+    const RgbaColor gravity_color = {
+        in_plane.r + normal * (along_normal.r - in_plane.r),
+        in_plane.g + normal * (along_normal.g - in_plane.g),
+        in_plane.b + normal * (along_normal.b - in_plane.b), 1.0};
+    cairo_save(cr);
+    set_source_rgba(cr, gravity_color, alpha);
+    cairo_set_line_width(cr, theme.line_width * 2.0);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_move_to(cr, cx, cy);
+    cairo_line_to(cr, cx - circle_radius * projection * gravity.direction[0],
+                  cy - circle_radius * projection * gravity.direction[1]);
+    cairo_stroke(cr);
+    cairo_arc(cr, cx, cy, theme.line_width, 0.0, 2.0 * M_PI);
+    cairo_fill(cr);
+    cairo_restore(cr);
+  }
 }
 
 void draw_operator_present_icon(cairo_t *cr, int status, double cx, double cy,
