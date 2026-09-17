@@ -4,7 +4,7 @@
   "dvrk_console_namespace": "console",
   "gst_input": "videotestsrc pattern=smpte is-live=true ! video/x-raw,width=1280,height=480,framerate=30/1",
   "eye_size": {"width": 640, "height": 480},
-  "sinks": ["glimage"],
+  "sinks": ["side_by_side"],
   "ar": {
     "enabled": true,
     "left": {"gst_input": "@dvrk:stereo_source:left_ar"},

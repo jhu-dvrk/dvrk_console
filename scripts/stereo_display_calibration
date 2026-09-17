@@ -269,7 +269,9 @@ def main():
         config = json.load(f)
 
     try:
-        split_mode = args.split or "glimages" in config.get("sinks", [])
+        split_mode = args.split or any(
+            s in config.get("sinks", []) for s in ("separate", "glimages")
+        )
         display_horizontal_offset = interactive_display_tune(
             config, split_mode=split_mode
         )

@@ -4,5 +4,5 @@
   "dvrk_console_namespace": "console",
   "gst_input": "@dvrk:stereo_alignment:stereo",
   "eye_size": {"width": 1920, "height": 1080},
-  "sinks": ["glimages"]
+  "sinks": ["separate"]
 }

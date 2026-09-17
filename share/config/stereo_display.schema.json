@@ -17,7 +17,7 @@
     "eye_size": { "$ref": "#/$defs/size" },
     "sinks": {
       "type": "array",
-      "items": { "enum": ["glimage", "glimages"] },
+      "items": { "enum": ["side_by_side", "separate", "headless", "glimage", "glimages"] },
       "default": []
     },
     "pip_gst_inputs": {

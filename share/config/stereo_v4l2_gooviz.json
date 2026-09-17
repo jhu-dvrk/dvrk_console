@@ -5,5 +5,5 @@
   "display_horizontal_offset_px": 18,
   "gst_input": "@dvrk:stereo_alignment:stereo",
   "eye_size": {"width": 640, "height": 480},
-  "sinks": ["glimage"]
+  "sinks": ["side_by_side"]
 }

@@ -294,16 +294,35 @@ gboolean on_sigint(gpointer) {
 // Helper: ensure a pixel count is even (round down)
 static int make_even(int v) { return v & ~1; }
 
+static bool is_side_by_side_sink(const std::string &sink) {
+  return sink == "side_by_side" || sink == "glimage";
+}
+
+static bool is_separate_sink(const std::string &sink) {
+  return sink == "separate" || sink == "glimages";
+}
+
+static bool is_headless_sink(const std::string &sink) {
+  return sink == "headless";
+}
+
+static bool is_valid_sink(const std::string &sink) {
+  return is_side_by_side_sink(sink) || is_separate_sink(sink) || is_headless_sink(sink);
+}
+
 std::string
 build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_overlay) {
   const int eye_w = stereo.original_width;
   const int eye_h = stereo.original_height;
   const int stereo_w = 2 * eye_w;
 
-  const bool has_glimage = std::find(stereo.sinks.begin(), stereo.sinks.end(),
-                                     "glimage") != stereo.sinks.end();
-  const bool has_glimages = std::find(stereo.sinks.begin(), stereo.sinks.end(),
-                                      "glimages") != stereo.sinks.end();
+  const bool has_side_by_side =
+      std::any_of(stereo.sinks.begin(), stereo.sinks.end(), is_side_by_side_sink);
+  const bool has_separate =
+      std::any_of(stereo.sinks.begin(), stereo.sinks.end(), is_separate_sink);
+  const bool has_headless =
+      std::any_of(stereo.sinks.begin(), stereo.sinks.end(), is_headless_sink);
+  (void)has_headless;
 
   const auto &es = stereo.pip_gst_inputs;
   const int n_mono = static_cast<int>(es.monos.size());
@@ -490,7 +509,7 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
 
   const bool has_stereo_socket_output = !stereo.stereo.gst_output.empty();
 
-  const bool has_display_output = has_glimage || has_glimages;
+  const bool has_display_output = has_side_by_side || has_separate;
   const int stereo_branches = (has_display_output ? 1 : 0) +
                               (has_stereo_socket_output ? 1 : 0);
 
@@ -599,18 +618,18 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
         output_chain += " ! glcolorconvert";
       }
 
-      if (has_glimage || has_glimages) {
+      if (has_side_by_side || has_separate) {
         output_chain += " ! tee name=__stereo_display_out__";
       }
 
-      if (has_glimage) {
+      if (has_side_by_side) {
         output_chain +=
             " __stereo_display_out__. ! queue max-size-buffers=1 "
             "leaky=downstream ! gtkglsink sync=false "
             "force-aspect-ratio=false name=__stereo_sink__";
       }
 
-      if (has_glimages) {
+      if (has_separate) {
         output_chain +=
             " __stereo_display_out__. ! queue max-size-buffers=1 "
             "leaky=downstream ! gldownload ! videoconvert "
@@ -898,10 +917,10 @@ int main(int argc, char *argv[]) {
   } else {
     std::string configured_sinks;
     for (const auto &sink : cfg.sinks) {
-      if (sink != "glimage" && sink != "glimages") {
+      if (!is_valid_sink(sink)) {
         RCLCPP_ERROR(
             node->get_logger(),
-            "Unsupported sink '%s'. Allowed values are: glimage, glimages",
+            "Unsupported sink '%s'. Allowed values are: side_by_side, separate, headless (or legacy glimage, glimages)",
             sink.c_str());
         rclcpp::shutdown();
         return 1;
