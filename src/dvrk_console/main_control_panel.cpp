@@ -844,7 +844,7 @@ private:
 
         std::string pipe_str = "unixfdsrc socket-path=" + dvrk_gst::to_gst_path(path) + " socket-type=abstract do-timestamp=true "
             "! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream "
-            "! videoconvert ! gtksink name=sink";
+            "! videoconvert ! gtksink name=sink sync=false";
 
         GError* error = nullptr;
         GstElement* pipeline = gst_parse_launch(pipe_str.c_str(), &error);
