@@ -358,7 +358,7 @@ public:
           m_dvrk_powered_on(false),
           m_dark_mode(false)
     {
-        set_title("dVRK Control Panel");
+        set_title("dVRK Control Panel - " + m_console_name);
         set_default_size(1024, 600);
 
         m_monitor_manager = std::make_unique<dvrk_data::WindowMonitorManager>(*this, m_settings_name, "control_panel");
