@@ -14,7 +14,10 @@
     "display_horizontal_offset_px": { "type": "integer", "default": 0 },
     "gst_input": { "$ref": "#/$defs/gstInput" },
     "gst_output": { "$ref": "#/$defs/gstOutput" },
-    "eye_size": { "$ref": "#/$defs/size" },
+    "eye_size": {
+      "description": "Use 'auto' to derive each eye from the negotiated side-by-side input caps at startup, or specify a fixed per-eye size.",
+      "oneOf": [{ "const": "auto" }, { "$ref": "#/$defs/size" }]
+    },
     "sinks": {
       "type": "array",
       "items": { "enum": ["side_by_side", "separate", "headless", "glimage", "glimages"] },

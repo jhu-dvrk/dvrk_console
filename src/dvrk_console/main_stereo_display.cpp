@@ -31,6 +31,7 @@
 
 #include <dvrk_data/config.hpp>
 #include <dvrk_data/dvrk_gst_socket.hpp>
+#include <dvrk_data/video_caps.hpp>
 #include "display_output_panel.hpp"
 #include "overlay_renderer.hpp"
 #include "overlay_ros.hpp"
@@ -937,6 +938,40 @@ int main(int argc, char *argv[]) {
 
   std::string pipeline_string;
 
+  if (cfg.stereo.gst_input.empty()) {
+    RCLCPP_ERROR(node->get_logger(), "Config '%s' must define root gst_input",
+                 cfg.name.c_str());
+    rclcpp::shutdown();
+    return 1;
+  }
+  if (cfg.auto_eye_size) {
+    const std::string input = dvrk_gst::build_input(
+        cfg.stereo.gst_input, dvrk_gst::ROLE_STEREO_ALIGNMENT);
+    RCLCPP_INFO(node->get_logger(), "Waiting for stereo input dimensions");
+    const auto result = dvrk_video::probe_input_size(
+        input, [] { return rclcpp::ok(); },
+        [&] { RCLCPP_INFO(node->get_logger(), "Waiting for stereo video caps"); });
+    if (!result.error.empty()) {
+      RCLCPP_ERROR(node->get_logger(), "Cannot detect stereo input size: %s",
+                   result.error.c_str());
+      rclcpp::shutdown();
+      return 1;
+    }
+    if (result.size.width < 2 || (result.size.width & 1) != 0 ||
+        result.size.height <= 0) {
+      RCLCPP_ERROR(node->get_logger(),
+                   "Stereo input size %s is invalid: side-by-side width must be positive and even",
+                   dvrk_video::describe(result.size).c_str());
+      rclcpp::shutdown();
+      return 1;
+    }
+    cfg.original_width = result.size.width / 2;
+    cfg.original_height = result.size.height;
+    RCLCPP_INFO(node->get_logger(), "Detected stereo input %s (%dx%d per eye)",
+                dvrk_video::describe(result.size).c_str(),
+                cfg.original_width, cfg.original_height);
+  }
+
   RCLCPP_INFO(node->get_logger(), "Loaded viewer config: %s", cfg.name.c_str());
   console_name = cfg.dvrk_console_namespace;
   overlay_state->overlay_alpha = cfg.overlay_alpha;
@@ -960,14 +995,6 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (cfg.stereo.gst_input.empty()) {
-    RCLCPP_ERROR(node->get_logger(),
-                 "Config '%s' must define root gst_input",
-                 cfg.name.c_str());
-    rclcpp::shutdown();
-    return 1;
-  }
-
   if (!cfg.stereo.gst_output_specified) {
     cfg.stereo.gst_output =
         dvrk_gst::make(dvrk_gst::ROLE_STEREO_DISPLAY, "overlay");
@@ -975,7 +1002,8 @@ int main(int argc, char *argv[]) {
 
   cfg.stereo.gst_input = dvrk_gst::build_input(
       cfg.stereo.gst_input, dvrk_gst::ROLE_STEREO_ALIGNMENT,
-      2 * cfg.original_width, cfg.original_height);
+      cfg.auto_eye_size ? 0 : 2 * cfg.original_width,
+      cfg.auto_eye_size ? 0 : cfg.original_height);
   cfg.ar.left.gst_input = dvrk_gst::build_input(
       cfg.ar.left.gst_input, dvrk_gst::ROLE_STEREO_DISPLAY,
       cfg.original_width, cfg.original_height);
@@ -1307,6 +1335,26 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  std::atomic_bool video_caps_failed{false};
+  dvrk_video::CapsMonitor stereo_caps_monitor;
+  stereo_caps_monitor.label = "stereo display input";
+  stereo_caps_monitor.expected = {2 * cfg.original_width, cfg.original_height};
+  stereo_caps_monitor.on_error = [&](const std::string &message) {
+    video_caps_failed = true;
+    RCLCPP_ERROR(node->get_logger(), "%s", message.c_str());
+    g_main_context_invoke(nullptr, [](gpointer) -> gboolean {
+      if (g_app) g_app->quit();
+      return G_SOURCE_REMOVE;
+    }, nullptr);
+  };
+  if (!dvrk_video::add_caps_monitor(pipeline, "__stereo_src_q__",
+                                    &stereo_caps_monitor)) {
+    RCLCPP_ERROR(node->get_logger(), "Cannot monitor stereo input caps");
+    gst_object_unref(pipeline);
+    rclcpp::shutdown();
+    return 1;
+  }
+
   if (!pipeline_runtime.start(pipeline, node.get(), "stereo_display")) {
     RCLCPP_ERROR(node->get_logger(),
                  "Unable to attach GStreamer runtime to stereo pipeline");
@@ -1392,6 +1440,12 @@ int main(int argc, char *argv[]) {
     attach_overlays(new_pipeline);
     attach_timestamp_probes(new_pipeline, candidate_cfg, &timestamp_state);
     attach_ar_timestamp_probes(new_pipeline);
+    if (!dvrk_video::add_caps_monitor(new_pipeline, "__stereo_src_q__",
+                                      &stereo_caps_monitor)) {
+      RCLCPP_ERROR(node->get_logger(), "Cannot monitor rebuilt stereo input caps");
+      gst_object_unref(new_pipeline);
+      return;
+    }
 
     // Commit the swap only after the replacement has been parsed and wired.
     pipeline_runtime.stop();
@@ -1439,5 +1493,5 @@ int main(int argc, char *argv[]) {
   g_app.reset();
 
   rclcpp::shutdown();
-  return 0;
+  return video_caps_failed ? 1 : 0;
 }
