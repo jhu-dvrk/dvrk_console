@@ -4,6 +4,6 @@
   "dvrk_console_namespace": "console",
   "display_horizontal_offset_px": 18,
   "gst_input": "@dvrk:stereo_alignment:stereo",
-  "eye_size": {"width": 640, "height": 480},
+  "eye_size": "auto",
   "sinks": ["side_by_side"]
 }

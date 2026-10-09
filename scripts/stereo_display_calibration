@@ -15,7 +15,7 @@ The config must contain a root ``gst_input`` field pointing to the
 ``stereo_alignment`` output socket, e.g.::
 
     "gst_input": "@dvrk:stereo_alignment:stereo",
-    "eye_size": {"width": 1920, "height": 1080}
+    "eye_size": "auto"
 """
 
 import argparse
@@ -119,10 +119,12 @@ def interactive_display_tune(config, split_mode=False):
             "gst_input is required but not set in the config.\n"
             "Add a root 'gst_input' field, e.g.:\n"
             '  "gst_input": "@dvrk:stereo_alignment:stereo", '
-            '"eye_size": {"width": 1920, "height": 1080}}'
+            '"eye_size": "auto"}'
         )
 
     eye_size = config.get("eye_size", config.get("camera", {}).get("size", {}))
+    if eye_size == "auto":
+        eye_size = {}
     eye_w = int(eye_size.get("width", 0))
     eye_h = int(eye_size.get("height", 0))
     stereo_snippet = dvrk_gst.build_input(

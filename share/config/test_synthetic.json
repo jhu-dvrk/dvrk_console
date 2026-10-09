@@ -6,13 +6,10 @@
     "side_by_side"
   ],
   "gst_input": "@dvrk:stereo_alignment:stereo",
-  "eye_size": {
-      "width": 640,
-      "height": 480
-    },
+  "eye_size": "auto",
   "pip_gst_inputs": {
     "monos": [
-      {"gst_input": "videotestsrc pattern=checkers-4 is-live=true ! video/x-raw,width=320,height=240,framerate=30/1"}
+      {"gst_input": "videotestsrc pattern=checkers-4 is-live=true ! video/x-raw,framerate=30/1"}
     ],
     "scale": 0.3
   }
