@@ -892,6 +892,7 @@ private:
         save_persisted_user_settings();
         m_right_pane.show_all();
         m_right_pane.show();
+        m_main_paned.set_position(380);
         return true;
     }
 
@@ -1481,6 +1482,16 @@ private:
                 key_file.has_key("video", "source")) {
                 m_persisted_video_path =
                     key_file.get_string("video", "source");
+                if (!m_persisted_video_path.empty()) {
+                    const std::string canonical = resolve_video_source_path(m_persisted_video_path);
+                    if (!canonical.empty() &&
+                        std::none_of(m_video_sources.begin(), m_video_sources.end(),
+                                     [&canonical](const VideoSource& s) { return s.socket_path == canonical; })) {
+                        VideoSource vs{video_source_label(canonical), canonical};
+                        m_video_sources.push_back(vs);
+                        m_explicit_video_sources.push_back(vs);
+                    }
+                }
             }
             load_persisted_touchscreen_settings(key_file);
         } catch (const Glib::Error& error) {
@@ -1543,6 +1554,21 @@ private:
             m_window_monitor_index = m_monitor_manager->get_monitor_index();
             if (m_window_monitor_index != previous_monitor_index) {
                 apply_touchscreen_settings_for_current_monitor(false);
+            }
+        }
+
+        if (m_current_video_path.empty()) {
+            refresh_video_sources();
+            if (!m_video_sources.empty()) {
+                auto selected = std::find_if(
+                    m_video_sources.begin(), m_video_sources.end(),
+                    [this](const VideoSource& source) {
+                        return source.socket_path == m_persisted_video_path;
+                    });
+                if (selected == m_video_sources.end()) {
+                    selected = m_video_sources.begin();
+                }
+                open_video_source(selected->socket_path);
             }
         }
         return true;
