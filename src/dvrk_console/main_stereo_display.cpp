@@ -38,7 +38,9 @@
 #include "overlay_state.hpp"
 #include "glib_ros_executor.hpp"
 #include "gst_pipeline_runtime.hpp"
+#include "optional_ar_input.hpp"
 #include <dvrk_data/cpu_timestamp_meta.hpp>
+#include <dvrk_data/stereo_timestamp_meta.hpp>
 #include <dvrk_data/stereo_common.hpp>
 
 namespace {
@@ -49,13 +51,6 @@ struct CommandLineOptions {
 };
 
 static Glib::RefPtr<Gtk::Application> g_app;
-
-struct FrameTimestampState {
-  std::mutex mutex;
-  gint64 left_source_ts = 0;
-  gint64 right_source_ts = 0;
-  gint64 stereo_output_ts = 0;
-};
 
 void print_usage(const char *executable) {
   std::cerr << "Usage: " << executable
@@ -157,86 +152,14 @@ bool check_element_available(const std::string &element_name) {
   return false;
 }
 
-GstPadProbeReturn frame_timestamp_probe_cb(GstPad *pad, GstPadProbeInfo *info,
-                                           gpointer user_data) {
-  (void)pad;
-  if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
-    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!gst_buffer_is_writable(buf)) {
-      buf = gst_buffer_make_writable(buf);
-      GST_PAD_PROBE_INFO_DATA(info) = buf;
-    }
-
-    auto *state = static_cast<FrameTimestampState *>(user_data);
-    if (state == nullptr) {
-      return GST_PAD_PROBE_OK;
-    }
-
-    std::string element_name;
-    GstElement *parent = gst_pad_get_parent_element(pad);
-    if (parent != nullptr) {
-      const char *name = GST_OBJECT_NAME(parent);
-      if (name != nullptr) {
-        element_name = name;
-      }
-      gst_object_unref(parent);
-    }
-
-    DcFrameTimestamps timestamps = dc_buffer_get_frame_timestamps(buf);
-    const gint64 now = dc_clock_realtime_ns();
-
-    {
-      std::scoped_lock<std::mutex> lock(state->mutex);
-      if (element_name == "__left_src_q__") {
-        timestamps.left_source_ts = now;
-        state->left_source_ts = now;
-      } else if (element_name == "__right_src_q__") {
-        timestamps.right_source_ts = now;
-        state->right_source_ts = now;
-      } else if (element_name == "__stereo_src_q__") {
-        if (timestamps.left_source_ts != 0) {
-          state->left_source_ts = timestamps.left_source_ts;
-        }
-        if (timestamps.right_source_ts != 0) {
-          state->right_source_ts = timestamps.right_source_ts;
-        }
-        if (timestamps.stereo_output_ts != 0) {
-          state->stereo_output_ts = timestamps.stereo_output_ts;
-        }
-      } else {
-        if (timestamps.left_source_ts == 0) {
-          timestamps.left_source_ts = state->left_source_ts;
-        }
-        if (timestamps.right_source_ts == 0) {
-          timestamps.right_source_ts = state->right_source_ts;
-        }
-
-        if (element_name == "__stereo_output_q__") {
-          timestamps.stereo_output_ts = now;
-          state->stereo_output_ts = now;
-        }
-      }
-    }
-
-    dc_buffer_set_frame_timestamps(buf, timestamps);
-  }
+GstPadProbeReturn overlay_timestamp_probe_cb(GstPad *, GstPadProbeInfo *info, gpointer) {
+  if (!(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+  GstBuffer *buffer = gst_buffer_make_writable(GST_PAD_PROBE_INFO_BUFFER(info));
+  GST_PAD_PROBE_INFO_DATA(info) = buffer;
+  auto timestamps = dc_buffer_get_frame_timestamps(buffer);
+  timestamps.overlay_output_ts = dc_clock_realtime_ns();
+  dc_buffer_set_frame_timestamps(buffer, timestamps);
   return GST_PAD_PROBE_OK;
-}
-
-void add_timestamp_probe(GstElement *pipeline, const std::string &element_name,
-                         FrameTimestampState *timestamp_state) {
-  GstElement *element =
-      gst_bin_get_by_name(GST_BIN(pipeline), element_name.c_str());
-  if (!element) {
-    return;
-  }
-  GstPad *pad = gst_element_get_static_pad(element, "src");
-  if (pad != nullptr) {
-    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-                      frame_timestamp_probe_cb, timestamp_state, nullptr);
-    gst_object_unref(pad);
-  }
-  gst_object_unref(element);
 }
 
 GstPadProbeReturn ar_timestamp_probe_cb(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
@@ -261,7 +184,7 @@ GstPadProbeReturn ar_timestamp_probe_cb(GstPad *pad, GstPadProbeInfo *info, gpoi
 }
 
 void attach_ar_timestamp_probes(GstElement *pipeline) {
-  const std::vector<std::string> names = {"left_ar_src", "right_ar_src"};
+  const std::vector<std::string> names = {"left_ar_src", "right_ar_src", "stereo_ar_src"};
   for (const auto &name : names) {
     GstElement *element = gst_bin_get_by_name(GST_BIN(pipeline), name.c_str());
     if (element) {
@@ -276,11 +199,25 @@ void attach_ar_timestamp_probes(GstElement *pipeline) {
   }
 }
 
-void attach_timestamp_probes(GstElement *pipeline, const dvrk_data::AppConfig &cfg,
-                             FrameTimestampState *timestamp_state) {
-  add_timestamp_probe(pipeline, "__stereo_src_q__", timestamp_state);
-  if (!cfg.stereo.gst_output.empty())
-    add_timestamp_probe(pipeline, "__stereo_output_q__", timestamp_state);
+void attach_timestamp_probes(GstElement *pipeline) {
+  for (const char *name : {"left_ar_mix", "right_ar_mix", "mix", "__stereo_comp__", "stereo_ar_mix"}) {
+    GstElement *mixer = gst_bin_get_by_name(GST_BIN(pipeline), name);
+    if (!mixer) continue;
+    const bool camera_only = std::string(name) == "left_ar_mix" || std::string(name) == "right_ar_mix" || std::string(name) == "stereo_ar_mix";
+    if (!dc_attach_mixer_timestamps(mixer, camera_only))
+      std::cerr << "Cannot preserve selected-frame metadata for " << name << std::endl;
+    gst_object_unref(mixer);
+  }
+  for (const char *name : {"stereo_overlay", "stereo_overlay_unixfd", "__stereo_output_q__"}) {
+    GstElement *element = gst_bin_get_by_name(GST_BIN(pipeline), name);
+    if (!element) continue;
+    GstPad *pad = gst_element_get_static_pad(element, "src");
+    if (pad) {
+      gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, overlay_timestamp_probe_cb, nullptr, nullptr);
+      gst_object_unref(pad);
+    }
+    gst_object_unref(element);
+  }
 }
 
 gboolean on_sigint(gpointer) {
@@ -333,6 +270,7 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
   const bool has_ar = stereo.ar.enabled &&
                       (!stereo.ar.left.gst_input.empty() ||
                        !stereo.ar.right.gst_input.empty());
+  const bool has_stereo_ar = stereo.ar.enabled && !stereo.ar.stereo.gst_input.empty();
   const bool split_stereo_for_presentation = has_extra || has_ar;
 
   int stereo_h = eye_h;
@@ -437,7 +375,7 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
                     " target-b=" + std::to_string(stereo.ar.color_key_b);
       }
       left_chain +=
-          stereo.ar.left.gst_input + " ! identity name=left_ar_src"
+          dvrk_console::OptionalARInput::source("left_ar_input") + " ! identity name=left_ar_src"
           " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
           " leaky=downstream"
           " ! videoconvert ! video/x-raw,format=RGBA" +
@@ -477,7 +415,7 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
                     " target-b=" + std::to_string(stereo.ar.color_key_b);
       }
       right_chain +=
-          stereo.ar.right.gst_input + " ! identity name=right_ar_src"
+          dvrk_console::OptionalARInput::source("right_ar_input") + " ! identity name=right_ar_src"
           " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
           " leaky=downstream"
           " ! videoconvert ! video/x-raw,format=RGBA" +
@@ -515,6 +453,21 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
                               (has_stereo_socket_output ? 1 : 0);
 
   std::string output_chain = presentation_chain;
+  if (has_stereo_ar) {
+    output_chain += " ! stereo_ar_mix.sink_0 "
+        "glvideomixer name=stereo_ar_mix background=1 force-live=true"
+        " sink_0::zorder=1 sink_0::xpos=0 sink_0::ypos=0"
+        " sink_0::width=" + std::to_string(stereo_w) +
+        " sink_0::height=" + std::to_string(eye_h) +
+        " sink_1::zorder=2 sink_1::xpos=0 sink_1::ypos=0"
+        " sink_1::width=" + std::to_string(stereo_w) +
+        " sink_1::height=" + std::to_string(eye_h) + " " +
+        dvrk_console::OptionalARInput::source("stereo_ar_input") +
+        " ! identity name=stereo_ar_src ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream"
+        " ! videoconvert ! video/x-raw,format=RGBA ! glupload ! stereo_ar_mix.sink_1 "
+        "stereo_ar_mix. ! video/x-raw(memory:GLMemory),width=" +
+        std::to_string(stereo_w) + ",height=" + std::to_string(eye_h);
+  }
   if (stereo_branches > 0) {
     if (stereo_branches > 1) {
       output_chain += " ! tee name=__stereo_out__ ";
@@ -938,6 +891,8 @@ int main(int argc, char *argv[]) {
 
   std::string pipeline_string;
 
+  if (cfg.stereo.gst_input.empty())
+    cfg.stereo.gst_input = dvrk_gst::make(dvrk_gst::ROLE_STEREO_ALIGNMENT, "stereo");
   if (cfg.stereo.gst_input.empty()) {
     RCLCPP_ERROR(node->get_logger(), "Config '%s' must define root gst_input",
                  cfg.name.c_str());
@@ -1004,12 +959,6 @@ int main(int argc, char *argv[]) {
       cfg.stereo.gst_input, dvrk_gst::ROLE_STEREO_ALIGNMENT,
       cfg.auto_eye_size ? 0 : 2 * cfg.original_width,
       cfg.auto_eye_size ? 0 : cfg.original_height);
-  cfg.ar.left.gst_input = dvrk_gst::build_input(
-      cfg.ar.left.gst_input, dvrk_gst::ROLE_STEREO_DISPLAY,
-      cfg.original_width, cfg.original_height);
-  cfg.ar.right.gst_input = dvrk_gst::build_input(
-      cfg.ar.right.gst_input, dvrk_gst::ROLE_STEREO_DISPLAY,
-      cfg.original_width, cfg.original_height);
 
   if (!cfg.stereo.gst_output.empty() &&
       dvrk_gst::resolve(cfg.stereo.gst_output).empty()) {
@@ -1363,8 +1312,18 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  FrameTimestampState timestamp_state;
-  attach_timestamp_probes(pipeline, cfg, &timestamp_state);
+  dvrk_console::OptionalARInput left_ar, right_ar, stereo_ar;
+  auto start_ar_inputs = [&] {
+    left_ar.start(pipeline, "left_ar_input", cfg.ar.left.gst_input,
+                  cfg.original_width, cfg.original_height, node.get());
+    right_ar.start(pipeline, "right_ar_input", cfg.ar.right.gst_input,
+                   cfg.original_width, cfg.original_height, node.get());
+    stereo_ar.start(pipeline, "stereo_ar_input", cfg.ar.stereo.gst_input,
+                    2 * cfg.original_width, cfg.original_height, node.get());
+  };
+  start_ar_inputs();
+
+  attach_timestamp_probes(pipeline);
   attach_ar_timestamp_probes(pipeline);
 
   // Helper: attach cairo overlay signals to all overlay elements in a pipeline.
@@ -1438,7 +1397,7 @@ int main(int argc, char *argv[]) {
 
     // Re-attach overlay signals
     attach_overlays(new_pipeline);
-    attach_timestamp_probes(new_pipeline, candidate_cfg, &timestamp_state);
+    attach_timestamp_probes(new_pipeline);
     attach_ar_timestamp_probes(new_pipeline);
     if (!dvrk_video::add_caps_monitor(new_pipeline, "__stereo_src_q__",
                                       &stereo_caps_monitor)) {
@@ -1448,11 +1407,15 @@ int main(int argc, char *argv[]) {
     }
 
     // Commit the swap only after the replacement has been parsed and wired.
+    left_ar.stop();
+    right_ar.stop();
+    stereo_ar.stop();
     pipeline_runtime.stop();
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
     pipeline = new_pipeline;
     cfg = candidate_cfg;
+    start_ar_inputs();
 
     if (!pipeline_runtime.start(pipeline, node.get(), "stereo_display")) {
       RCLCPP_ERROR(node->get_logger(),
@@ -1482,6 +1445,9 @@ int main(int argc, char *argv[]) {
   RCLCPP_INFO(node->get_logger(), "Stereo display pipeline on quit: %s",
               pipeline_string.c_str());
 
+  left_ar.stop();
+  right_ar.stop();
+  stereo_ar.stop();
   pipeline_runtime.stop();
 
   if (pipeline) {

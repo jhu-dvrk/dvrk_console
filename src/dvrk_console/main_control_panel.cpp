@@ -42,6 +42,7 @@
 #include <dvrk_data/window_monitor_manager.hpp>
 #include "glib_ros_executor.hpp"
 #include "gst_pipeline_runtime.hpp"
+#include "annotation_panel.hpp"
 
 // Configuration and State structures
 struct ArmStatus {
@@ -62,9 +63,12 @@ struct ResetState {
 struct VideoSource {
     std::string label;
     std::string socket_path;
+    int eye = -1;  // 0 = left half, 1 = right half; -1 = explicit mono source
 };
 
 struct ControlPanelConfig {
+    dvrk_console::AnnotationConfig annotations;
+    bool annotations_enabled = false;
     std::string name = "dvrk_display";
     std::string console = "console";
     std::vector<std::string> video_sources;
@@ -74,6 +78,7 @@ struct CommandLineOptions {
     std::string config_file;
     std::string console_name;
     bool console_override = false;
+    bool annotations_enabled = false;
     std::vector<std::string> video_sources;
 };
 
@@ -213,26 +218,55 @@ std::string resolve_video_source_path(const std::string &source) {
     return dvrk_gst::resolve(source, dvrk_gst::ROLE_STEREO_DISPLAY);
 }
 
-/// Scan /proc/net/unix for active @dvrk abstract sockets.
+/// Expose only the two eye views of supported side-by-side stereo sockets.
+std::vector<VideoSource> stereo_eye_sources(const std::string &name) {
+    std::string role;
+    if (name == "@dvrk:stereo_source:stereo") role = "stereo_source";
+    else if (name == "@dvrk:stereo_alignment:stereo") role = "stereo_alignment";
+    else if (name == "@dvrk:stereo_display:overlay") role = "overlay";
+    else return {};
+    return {{"stereo::left (" + role + ")", name, 0},
+            {"stereo::right (" + role + ")", name, 1}};
+}
+
+std::string video_source_key(const VideoSource &source) {
+    return source.socket_path + "#" + std::to_string(source.eye);
+}
+
 std::vector<VideoSource> scan_available_video_sources() {
     std::vector<VideoSource> found;
     for (const auto &name : dvrk_gst::list_sockets()) {
-        found.push_back(VideoSource{video_source_label(name), name});
+        auto eyes = stereo_eye_sources(name);
+        found.insert(found.end(), eyes.begin(), eyes.end());
     }
-    std::sort(found.begin(), found.end(),
-              [](const VideoSource &a, const VideoSource &b) {
-                  return a.label < b.label;
-              });
     return found;
+}
+
+// Read negotiated input caps before videocrop forwards them downstream.
+GstPadProbeReturn configure_stereo_eye_crop(GstPad *, GstPadProbeInfo *info, gpointer data) {
+    auto *crop = GST_ELEMENT(data);
+    auto *event = GST_PAD_PROBE_INFO_EVENT(info);
+    if (GST_EVENT_TYPE(event) != GST_EVENT_CAPS) return GST_PAD_PROBE_OK;
+    GstCaps *caps = nullptr;
+    gst_event_parse_caps(event, &caps);
+    GstStructure *structure = gst_caps_get_structure(caps, 0);
+    int width = 0;
+    if (!gst_structure_get_int(structure, "width", &width) || width < 2 || width % 2)
+        return GST_PAD_PROBE_DROP;
+    const int eye = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(crop), "eye"));
+    g_object_set(crop, "left", eye == 1 ? width / 2 : 0,
+                "right", eye == 0 ? width / 2 : 0, nullptr);
+    return GST_PAD_PROBE_OK;
 }
 
 void print_usage(const char *executable) {
     std::cerr << "Usage: " << executable
-              << " [-c <config.json>] [-C <console>] [-s <video-source>]..."
+              << " [-c <config.json>] [-C <console>] [-s <video-source>]... [-a]"
               << std::endl;
     std::cerr << "  -c, --config   Control panel JSON config file" << std::endl;
     std::cerr << "  -C, --console  dVRK console namespace override" << std::endl;
     std::cerr << "  -s, --source   Video source in @dvrk:role:name form" << std::endl;
+    std::cerr << "  -a, --annotations  Enable video annotations" << std::endl;
 }
 
 bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
@@ -240,6 +274,11 @@ bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
         const std::string arg = argv[i];
         if (arg == "--ros-args") {
             break;
+        }
+
+        if (arg == "-a" || arg == "--annotations") {
+            options.annotations_enabled = true;
+            continue;
         }
 
         if ((arg == "-c" || arg == "--config") && i + 1 < argc) {
@@ -315,10 +354,39 @@ bool load_control_panel_config(const std::string& path, ControlPanelConfig& conf
         }
     }
 
-    if (!root.isMember("video_source") || !root["video_source"].isArray()) {
+    if (root.isMember("video_source") && !root["video_source"].isArray()) {
         std::cerr << "Configuration error: 'video_source' must be an array of strings."
                   << std::endl;
         return false;
+    }
+
+    if (root.isMember("annotations")) {
+        const auto& annotation = root["annotations"];
+        if (!annotation.isObject()) {
+            std::cerr << "Configuration error: annotations must be an object." << std::endl;
+            return false;
+        }
+        // The preview is always the final stereo overlay. Only the output socket
+        // may be overridden, so touch coordinates match the displayed pixels.
+        for (const auto& key : annotation.getMemberNames()) {
+            if (key != "gst_output") {
+                std::cerr << "Configuration error: annotations only supports gst_output." << std::endl;
+                return false;
+            }
+        }
+        if (annotation.isMember("gst_output")) {
+            const auto& value = annotation["gst_output"];
+            if (!value.isString() || !dvrk_gst::is_socket_reference(value.asString())) {
+                std::cerr << "Configuration error: invalid annotations.gst_output." << std::endl;
+                return false;
+            }
+            config.annotations.gst_output = value.asString();
+        }
+        if (config.annotations.gst_input == config.annotations.gst_output) {
+            std::cerr << "Configuration error: annotation input and output must be distinct." << std::endl;
+            return false;
+        }
+        config.annotations_enabled = true;
     }
 
     config.video_sources.clear();
@@ -343,16 +411,18 @@ public:
     ControlPanelWindow(std::shared_ptr<rclcpp::Node> node, 
                       const std::string& settings_name,
                       const std::string& console_name,
-                      const std::vector<VideoSource>& video_sources)
+                      const std::vector<VideoSource>& video_sources,
+                      const dvrk_console::AnnotationConfig& annotations,
+                      bool annotations_enabled)
         : m_node(node), m_settings_name(settings_name), m_console_name(console_name),
           m_video_sources(video_sources),
           m_explicit_video_sources(video_sources),
           m_root_overlay(),
-          m_main_paned(Gtk::ORIENTATION_HORIZONTAL),
-          m_left_pane(Gtk::ORIENTATION_VERTICAL, 10),
+          m_main_box(Gtk::ORIENTATION_HORIZONTAL),
+          m_left_pane(Gtk::ORIENTATION_VERTICAL, 4),
           m_right_pane(Gtk::ORIENTATION_VERTICAL, 5),
-          m_arms_box(Gtk::ORIENTATION_VERTICAL, 6),
-          m_teleops_box(Gtk::ORIENTATION_VERTICAL, 6),
+          m_arms_box(Gtk::ORIENTATION_VERTICAL, 2),
+          m_teleops_box(Gtk::ORIENTATION_VERTICAL, 2),
           m_reset_timer_active(false),
           m_teleop_master_enabled(false),
           m_dvrk_powered_on(false),
@@ -371,13 +441,13 @@ public:
         // Build left control panel structure
         setup_left_pane();
 
-        // Setup Main Resizable Layout - always use paned so we can show right pane dynamically
+        // Keep controls at their current width and let the video use the remaining space.
+        m_left_pane.set_size_request(310, -1);
         m_right_pane.set_hexpand(true);
         m_right_pane.set_vexpand(true);
-        m_main_paned.pack1(m_left_pane, false, false); // Keep left controls fixed size on window resize
-        m_main_paned.pack2(m_right_pane, true, false);  // Let right video expand to fill extra space
-        m_main_paned.set_position(380); // Heuristic initial split: 380px for controls, rest for video
-        m_root_overlay.add(m_main_paned);
+        m_main_box.pack_start(m_left_pane, Gtk::PACK_SHRINK);
+        m_main_box.pack_start(m_right_pane, Gtk::PACK_EXPAND_WIDGET);
+        m_root_overlay.add(m_main_box);
         add(m_root_overlay);
 
         // Observe touch sequences during GTK's capture phase without claiming
@@ -403,9 +473,7 @@ public:
         m_touch_drag_gesture->signal_drag_end().connect(
             sigc::mem_fun(*this, &ControlPanelWindow::on_touch_drag_end));
 
-        if (m_video_sources.empty()) {
-            m_right_pane.hide();
-        }
+        refresh_video_sources();
 
         // Initialize ROS2 Publishers and Subscribers
         setup_ros();
@@ -417,7 +485,11 @@ public:
         show_all_children();
 
         // Build right video panel structure and start pipelines AFTER the layout is attached and shown
+        if (annotations_enabled) {
+            m_annotations = std::make_unique<dvrk_console::AnnotationPanel>(m_node.get(), annotations);
+        }
         setup_right_pane();
+        if (m_annotations) m_annotations->start();
 
         if (m_have_persisted_display_settings) {
             Glib::signal_idle().connect_once([this]() {
@@ -516,8 +588,10 @@ private:
         int arm_name_size = std::max(14, std::min(22, height / 36));
         int status_size = std::max(12, std::min(18, height / 40));
         int tool_size = std::max(11, std::min(16, height / 48));
-        int reset_btn_size = std::max(30, std::min(48, height / 16));
+        int reset_btn_size = std::max(30, std::min(34, height / 16));
         int reset_font_size = std::max(14, std::min(22, height / 24));
+        int wrench_btn_size = std::max(48, (reset_btn_size * 6 + 2) / 5);
+        int wrench_font_size = (reset_font_size * 6 + 2) / 5;
         int padding_size = std::max(4, std::min(12, height / 90));
         int margin_size = std::max(3, std::min(8, height / 120));
 
@@ -526,18 +600,26 @@ private:
         std::stringstream ss;
         if (m_dark_mode) {
             ss << "window { background-color: #121214; color: #e2e2e9; font-family: 'Inter', 'Sans', sans-serif; }\n"
-               << "frame { border: 1px solid #2d2d34; border-radius: 10px; margin: " << margin_size << "px; padding: " << padding_size << "px; background-color: #1a1a1e; }\n"
+               << "button { background-color: #b4bbc4; background-image: none; color: #20262d; border: 1px solid #8e98a3; box-shadow: none; }\n"
+               << "button:hover { background-color: #c3c9d0; background-image: none; }\n"
+               << "button:checked, button:active { background-color: #929da9; background-image: none; color: #151b21; }\n"
+               << "button:checked:hover { background-color: #929da9; }\n"
+               << "frame { border: none; border-radius: 10px; margin: " << margin_size << "px; padding: " << padding_size << "px; background-color: #1a1a1e; box-shadow: inset 0 1px rgba(255,255,255,0.10), 0 2px 5px rgba(0,0,0,0.45); }\n"
+               << "frame > border { border: none; box-shadow: none; }\n"
                << "frame label { font-weight: bold; color: #00adb5; font-size: " << frame_title_size << "px; }\n"
-               << "button.reset-btn { background-color: #2a2b36; color: #ff5722; border: 1px solid #3f4052; border-radius: 50%; padding: 0px; font-size: " << reset_font_size << "px; min-width: " << reset_btn_size << "px; min-height: " << reset_btn_size << "px; }\n"
-               << "button.reset-btn:hover { background-color: #3f4052; color: #ff784e; }\n"
+               << "button.reset-btn { background-color: #2a2b36; background-image: none; color: #ff5722; border: 1px solid #3f4052; border-radius: 50%; padding: 0px; font-size: " << reset_font_size << "px; min-width: " << reset_btn_size << "px; min-height: " << reset_btn_size << "px; }\n"
+               << "button.reset-btn:hover { background-color: #3f4052; background-image: none; color: #ff784e; }\n"
                << "label.arm-name { font-weight: bold; font-size: " << arm_name_size << "px; color: #ffffff; }\n"
                << "label.arm-status { font-size: " << status_size << "px; font-weight: bold; }\n"
                << "label.arm-tool { font-size: " << tool_size << "px; color: #00adb5; font-style: italic; }\n"
                << "scale slider { min-height: " << slider_handle_size << "px; min-width: " << slider_handle_size << "px; background-color: #00adb5; border-radius: 50%; }\n"
                << "scale trough { border-radius: 8px; background-color: #2d2d34; }\n"
-               << "combobox { background-color: #1a1a1e; color: #ffffff; }\n"
-               << "combobox * { background-color: #1a1a1e; color: #ffffff; }\n"
-               << "combobox { border: 1px solid #2d2d34; padding: 6px; font-size: " << status_size << "px; }\n"
+               << "combobox.annotation-choice button { background: #292b34; background-image: none; color: #e2e2e9; border: 1px solid #454854; border-radius: 6px; box-shadow: none; padding: 2px 4px; font-size: 12px; }\n"
+               << "combobox.annotation-choice button:hover, combobox.annotation-choice button:active, combobox.annotation-choice button:checked, combobox.annotation-choice button:focus { background: #363944; background-image: none; color: #ffffff; border-color: #00adb5; box-shadow: none; }\n"
+               << "combobox.annotation-choice button cellview, combobox.annotation-choice button arrow { color: #e2e2e9; }\n"
+               << "combobox.annotation-choice window.popup menu { background-color: #1a1a1e; border-color: #454854; }\n"
+               << "menu arrow { background-color: #292b34; color: #e2e2e9; border: none; }\n"
+               << "box.annotation-tools button { padding: 2px 4px; min-width: 0; font-size: 12px; }\n"
                << "label.slider-name { font-weight: bold; font-size: " << status_size << "px; color: #e2e2e9; }\n"
                << "label.slider-val { font-size: " << status_size << "px; color: #e2e2e9; }\n"
                << "menu { background-color: #1a1a1e; border: 1px solid #2d2d34; border-radius: 8px; padding: 6px; }\n"
@@ -547,7 +629,8 @@ private:
                << "menuitem:hover label { color: #ffffff; }\n";
         } else {
             ss << "window { background-color: #f4f5f8; color: #2d3748; font-family: 'Inter', 'Sans', sans-serif; }\n"
-               << "frame { border: 1px solid #cbd5e0; border-radius: 10px; margin: " << margin_size << "px; padding: " << padding_size << "px; background-color: #ffffff; }\n"
+               << "frame { border: none; border-radius: 10px; margin: " << margin_size << "px; padding: " << padding_size << "px; background-color: #ffffff; box-shadow: inset 0 1px rgba(255,255,255,0.95), 0 2px 5px rgba(45,55,72,0.18); }\n"
+               << "frame > border { border: none; box-shadow: none; }\n"
                << "frame label { font-weight: bold; color: #008080; font-size: " << frame_title_size << "px; }\n"
                << "button.reset-btn { background-color: #edf2f7; color: #e53e3e; border: 1px solid #cbd5e0; border-radius: 50%; padding: 0px; font-size: " << reset_font_size << "px; min-width: " << reset_btn_size << "px; min-height: " << reset_btn_size << "px; }\n"
                << "button.reset-btn:hover { background-color: #e2e8f0; color: #c53030; }\n"
@@ -556,9 +639,12 @@ private:
                << "label.arm-tool { font-size: " << tool_size << "px; color: #008080; font-style: italic; }\n"
                << "scale slider { min-height: " << slider_handle_size << "px; min-width: " << slider_handle_size << "px; background-color: #008080; border-radius: 50%; }\n"
                << "scale trough { border-radius: 8px; background-color: #edf2f7; }\n"
-               << "combobox { background-color: #ffffff; color: #2d3748; }\n"
-               << "combobox * { background-color: #ffffff; color: #2d3748; }\n"
-               << "combobox { border: 1px solid #cbd5e0; padding: 6px; font-size: " << status_size << "px; }\n"
+               << "combobox.annotation-choice button { background: #ffffff; background-image: none; color: #2d3748; border: 1px solid #cbd5e0; border-radius: 6px; box-shadow: none; padding: 2px 4px; font-size: 12px; }\n"
+               << "combobox.annotation-choice button:hover, combobox.annotation-choice button:active, combobox.annotation-choice button:checked, combobox.annotation-choice button:focus { background: #edf2f7; background-image: none; color: #1a202c; border-color: #008080; box-shadow: none; }\n"
+               << "combobox.annotation-choice button cellview, combobox.annotation-choice button arrow { color: #2d3748; }\n"
+               << "combobox.annotation-choice window.popup menu { background-color: #ffffff; border-color: #cbd5e0; }\n"
+               << "menu arrow { background-color: #edf2f7; color: #2d3748; border: none; }\n"
+               << "box.annotation-tools button { padding: 2px 4px; min-width: 0; font-size: 12px; }\n"
                << "label.slider-name { font-weight: bold; font-size: " << status_size << "px; color: #2d3748; }\n"
                << "label.slider-val { font-size: " << status_size << "px; color: #2d3748; }\n"
                << "menu { background-color: #ffffff; border: 1px solid #cbd5e0; border-radius: 8px; padding: 6px; }\n"
@@ -567,6 +653,9 @@ private:
                << "menuitem:hover { color: #ffffff; background-color: #008080; }\n"
                << "menuitem:hover label { color: #ffffff; }\n";
         }
+        ss << "button.reset-btn.wrench-btn { min-width: " << wrench_btn_size
+           << "px; min-height: " << wrench_btn_size << "px; font-size: "
+           << wrench_font_size << "px; }\n";
 
         try {
             m_css_provider->load_from_data(ss.str());
@@ -584,14 +673,14 @@ private:
         // 1. Arms Status Frame (No label name)
         m_arms_box.set_margin_left(16);
         m_arms_box.set_margin_right(16);
-        m_arms_box.set_margin_top(12);
-        m_arms_box.set_margin_bottom(12);
+        m_arms_box.set_margin_top(4);
+        m_arms_box.set_margin_bottom(4);
         m_arms_frame.add(m_arms_box);
-        m_left_pane.pack_start(m_arms_frame, Gtk::PACK_EXPAND_WIDGET, 0);
+        m_left_pane.pack_start(m_arms_frame, Gtk::PACK_SHRINK, 0);
 
         // Master dVRK power button at the top of Arms Frame
         Gtk::Box* dvrk_master_layout = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 10));
-        dvrk_master_layout->set_margin_bottom(12);
+        dvrk_master_layout->set_margin_bottom(2);
 
         m_dvrk_power_btn = Gtk::manage(new Gtk::Button("⏻"));
         m_dvrk_power_btn->get_style_context()->add_class("reset-btn");
@@ -629,14 +718,14 @@ private:
         // 2. Teleops List Frame (No label name)
         m_teleops_box.set_margin_left(16);
         m_teleops_box.set_margin_right(16);
-        m_teleops_box.set_margin_top(12);
-        m_teleops_box.set_margin_bottom(12);
+        m_teleops_box.set_margin_top(4);
+        m_teleops_box.set_margin_bottom(4);
         m_teleops_frame.add(m_teleops_box);
-        m_left_pane.pack_start(m_teleops_frame, Gtk::PACK_EXPAND_WIDGET, 0);
+        m_left_pane.pack_start(m_teleops_frame, Gtk::PACK_SHRINK, 0);
 
         // Master enable/disable button inside Teleoperation Frame
         Gtk::Box* master_layout = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 10));
-        master_layout->set_margin_bottom(12);
+        master_layout->set_margin_bottom(2);
 
         m_teleop_enable_btn = Gtk::manage(new Gtk::Button("⏻"));
         m_teleop_enable_btn->get_style_context()->add_class("reset-btn");
@@ -667,12 +756,12 @@ private:
 
         // 3. System Frame (Scale & Volume) (No label name)
         Gtk::Grid* system_grid = Gtk::manage(new Gtk::Grid());
-        system_grid->set_row_spacing(10);
+        system_grid->set_row_spacing(4);
         system_grid->set_column_spacing(10);
         system_grid->set_margin_left(16);
         system_grid->set_margin_right(16);
-        system_grid->set_margin_top(12);
-        system_grid->set_margin_bottom(12);
+        system_grid->set_margin_top(4);
+        system_grid->set_margin_bottom(4);
 
         // Scale components
         Gtk::Label* scale_label = Gtk::manage(new Gtk::Label("Scale", Gtk::ALIGN_START));
@@ -716,18 +805,23 @@ private:
         system_grid->attach(*m_volume_slider, 1, 1, 1, 1);
         system_grid->attach(*m_volume_value_label, 2, 1, 1, 1);
 
-        // Add Wrench Settings button with margin space
-        m_wrench_btn = Gtk::manage(new Gtk::Button("🔧"));
-        m_wrench_btn->get_style_context()->add_class("reset-btn");
-        m_wrench_btn->set_valign(Gtk::ALIGN_CENTER);
-        m_wrench_btn->set_halign(Gtk::ALIGN_CENTER);
-        m_wrench_btn->set_margin_left(16);
-        m_wrench_btn->signal_clicked().connect(sigc::mem_fun(*this, &ControlPanelWindow::on_wrench_clicked));
-
-        system_grid->attach(*m_wrench_btn, 3, 0, 1, 2);
+        m_input_btn.set_label("Video Input");
+        m_input_btn.set_tooltip_text("Select a video input");
+        m_input_btn.set_size_request(-1, 44);
+        m_input_btn.signal_clicked().connect(sigc::mem_fun(*this, &ControlPanelWindow::on_input_clicked));
+        system_grid->attach(m_input_btn, 0, 2, 3, 1);
 
         m_system_frame.add(*system_grid);
         m_left_pane.pack_start(m_system_frame, Gtk::PACK_SHRINK, 0);
+
+        m_wrench_btn = Gtk::manage(new Gtk::Button("🔧"));
+        m_wrench_btn->get_style_context()->add_class("reset-btn");
+        m_wrench_btn->get_style_context()->add_class("wrench-btn");
+        m_wrench_btn->set_halign(Gtk::ALIGN_START);
+        m_wrench_btn->set_margin_left(24);
+        m_wrench_btn->set_margin_bottom(24);
+        m_wrench_btn->signal_clicked().connect(sigc::mem_fun(*this, &ControlPanelWindow::on_wrench_clicked));
+        m_left_pane.pack_end(*m_wrench_btn, Gtk::PACK_SHRINK);
 
         // Connect slider signals
         m_scale_connection = m_scale_slider->signal_value_changed().connect(
@@ -745,7 +839,7 @@ private:
     void create_arm_row(const std::string& name) {
         ArmRow row;
         row.container = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_HORIZONTAL, 10));
-        row.container->set_margin_bottom(4);
+        row.container->set_margin_bottom(0);
         row.container->set_margin_left(28); // Indent to show hierarchy under master button
 
         row.reset_button = Gtk::manage(new Gtk::Button("⟲"));
@@ -774,7 +868,7 @@ private:
         second_line->pack_start(*row.substate_label, Gtk::PACK_SHRINK);
 
         if (name.rfind("PSM", 0) == 0) {
-            row.tool_label = Gtk::manage(new Gtk::Label(" - No Instrument", Gtk::ALIGN_START));
+            row.tool_label = Gtk::manage(new Gtk::Label(" - No instrument", Gtk::ALIGN_START));
             row.tool_label->get_style_context()->add_class("arm-tool");
             second_line->pack_start(*row.tool_label, Gtk::PACK_SHRINK);
         } else {
@@ -801,21 +895,66 @@ private:
     void setup_right_pane() {
         m_video_area.set_hexpand(true);
         m_video_area.set_vexpand(true);
-        m_right_pane.pack_start(m_video_area, Gtk::PACK_EXPAND_WIDGET, 0);
+        m_video_tabs.add(m_video_area, "video", "Video");
+        if (m_annotations) m_video_tabs.add(*m_annotations, "annotate", "Annotate");
+        m_right_pane.pack_start(m_video_tabs, Gtk::PACK_EXPAND_WIDGET, 0);
+
+        if (m_annotations) {
+            m_annotate_btn.set_label("Annotate");
+            m_annotate_btn.set_size_request(-1, 44);
+            m_annotate_btn.signal_toggled().connect([this]() {
+                const bool annotating = m_annotate_btn.get_active();
+                m_video_tabs.set_visible_child(annotating ? "annotate" : "video");
+                if (annotating) m_annotation_controls.show();
+                else m_annotation_controls.hide();
+            });
+            m_annotation_bar.set_spacing(4);
+            m_annotation_bar.set_margin_left(6);
+            m_annotation_bar.set_margin_right(6);
+            m_annotation_bar.set_margin_top(4);
+            m_annotation_bar.set_margin_bottom(4);
+            m_annotation_bar.pack_start(m_annotate_btn, Gtk::PACK_SHRINK);
+            m_annotation_controls.set_spacing(3);
+            m_annotation_controls.get_style_context()->add_class("annotation-tools");
+            m_annotation_controls.set_no_show_all(true);
+            m_annotations->place_controls(m_annotation_controls);
+            m_annotation_bar.pack_end(m_annotation_controls, Gtk::PACK_SHRINK);
+            m_annotation_frame.add(m_annotation_bar);
+            m_right_pane.pack_start(m_annotation_frame, Gtk::PACK_SHRINK);
+        }
+
         if (!m_video_sources.empty()) {
             auto selected = std::find_if(
                 m_video_sources.begin(), m_video_sources.end(),
                 [this](const VideoSource& source) {
-                    return source.socket_path == m_persisted_video_path;
+                    return video_source_key(source) == m_persisted_video_path;
                 });
-            if (selected == m_video_sources.end()) {
-                selected = m_video_sources.begin();
-            }
-            open_video_source(selected->socket_path);
-            m_right_pane.show_all();
-        } else {
-            m_right_pane.hide();
+            if (selected == m_video_sources.end()) selected = m_video_sources.begin();
+            open_video_source(*selected);
         }
+        m_right_pane.show_all();
+        if (m_annotations) {
+            // Source changes call show_all(); keep the tools visible only in annotation mode.
+            m_annotation_controls.set_no_show_all(false);
+            m_annotation_controls.show_all();
+            m_annotation_controls.set_no_show_all(true);
+            m_annotation_controls.hide();
+        }
+    }
+
+    void on_input_clicked() {
+        for (auto* child : m_input_menu.get_children()) m_input_menu.remove(*child);
+        refresh_video_sources();
+        if (m_video_sources.empty()) {
+            auto* item = create_menu_item("No video inputs available");
+            item->set_sensitive(false);
+            m_input_menu.append(*item);
+        } else {
+            append_video_source_items(m_input_menu);
+        }
+        m_input_menu.show_all();
+        m_input_menu.popup_at_widget(&m_input_btn, Gdk::GRAVITY_SOUTH_WEST,
+                                     Gdk::GRAVITY_NORTH_WEST, nullptr);
     }
 
     void close_video_source() {
@@ -835,8 +974,9 @@ private:
         m_current_video_path.clear();
     }
 
-    bool open_video_source(const std::string& path) {
-        if (path == m_current_video_path && m_current_video_pipeline) {
+    bool open_video_source(const VideoSource& source) {
+        const std::string& path = source.socket_path;
+        if (video_source_key(source) == m_current_video_path && m_current_video_pipeline) {
             return true;
         }
 
@@ -844,7 +984,9 @@ private:
 
         std::string pipe_str = "unixfdsrc socket-path=" + dvrk_gst::to_gst_path(path) + " socket-type=abstract do-timestamp=true "
             "! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream "
-            "! videoconvert ! gtksink name=sink sync=false";
+            "! videoconvert ";
+        if (source.eye >= 0) pipe_str += "! videocrop name=eye_crop ";
+        pipe_str += "! gtksink name=sink sync=false";
 
         GError* error = nullptr;
         GstElement* pipeline = gst_parse_launch(pipe_str.c_str(), &error);
@@ -855,6 +997,15 @@ private:
             return false;
         }
 
+        if (source.eye >= 0) {
+            auto *crop = gst_bin_get_by_name(GST_BIN(pipeline), "eye_crop");
+            g_object_set_data(G_OBJECT(crop), "eye", GINT_TO_POINTER(source.eye));
+            auto *pad = gst_element_get_static_pad(crop, "sink");
+            gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                              configure_stereo_eye_crop, crop, nullptr);
+            gst_object_unref(pad);
+            gst_object_unref(crop);
+        }
         GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
         if (!sink) {
             std::cerr << "Failed to find gtksink for: " << path << std::endl;
@@ -888,11 +1039,10 @@ private:
         gst_element_set_state(pipeline, GST_STATE_PLAYING);
         m_current_video_widget = mm_widget;
         m_current_video_pipeline = pipeline;
-        m_current_video_path = path;
+        m_current_video_path = video_source_key(source);
         save_persisted_user_settings();
         m_right_pane.show_all();
         m_right_pane.show();
-        m_main_paned.set_position(380);
         return true;
     }
 
@@ -1330,7 +1480,10 @@ private:
         for (const auto& source : m_video_sources) {
             auto* item = create_menu_item(source.label);
             item->signal_activate().connect([this, source]() {
-                open_video_source(source.socket_path);
+                if (open_video_source(source)) {
+                    m_input_btn.set_tooltip_text("Video input: " + source.label);
+                    m_annotate_btn.set_active(false);
+                }
             });
             menu.append(*item);
         }
@@ -1340,14 +1493,14 @@ private:
         std::vector<VideoSource> new_sources = m_explicit_video_sources;
         std::unordered_set<std::string> seen_paths;
         for (const auto& src : new_sources) {
-            seen_paths.insert(src.socket_path);
+            seen_paths.insert(video_source_key(src));
         }
 
         std::vector<VideoSource> discovered = scan_available_video_sources();
         for (const auto& ds : discovered) {
-            if (seen_paths.find(ds.socket_path) == seen_paths.end()) {
+            if (seen_paths.find(video_source_key(ds)) == seen_paths.end()) {
                 new_sources.push_back(ds);
-                seen_paths.insert(ds.socket_path);
+                seen_paths.insert(video_source_key(ds));
             }
         }
         m_video_sources = new_sources;
@@ -1360,21 +1513,26 @@ private:
             m_wrench_menu.remove(*child);
         }
 
-        // Re-scan and merge available video sources dynamically
-        refresh_video_sources();
+        // Fullscreen toggle
+        bool is_fullscreen = is_window_fullscreen();
+        auto* fullscreen_item = create_menu_item(is_fullscreen ? "Exit Fullscreen" : "Fullscreen");
+        fullscreen_item->signal_activate().connect([this, is_fullscreen]() {
+            m_window_fullscreen = !is_fullscreen;
+            apply_window_display_settings();
+            save_persisted_display_settings();
+        });
+        m_wrench_menu.append(*fullscreen_item);
 
-        // 1. Add "Use video" submenu
-        if (!m_video_sources.empty()) {
-            auto* use_video_item = create_menu_item("Use video");
-            auto* video_sources_menu = Gtk::manage(new Gtk::Menu());
-            append_video_source_items(*video_sources_menu);
-            use_video_item->set_submenu(*video_sources_menu);
-            apply_menu_item_text_color(*use_video_item);
-            m_wrench_menu.append(*use_video_item);
-        }
+        // Touchscreen settings
+        auto* touchscreen_item = create_menu_item("Touchscreen");
+        auto* touchscreen_menu = Gtk::manage(new Gtk::Menu());
+        append_touchscreen_items(*touchscreen_menu);
+        touchscreen_item->set_submenu(*touchscreen_menu);
+        apply_menu_item_text_color(*touchscreen_item);
+        m_wrench_menu.append(*touchscreen_item);
 
-        // 2. Add "Send to" submenu
-        auto* send_to_item = create_menu_item("Send to");
+        // Monitor selection
+        auto* send_to_item = create_menu_item("Send To");
         auto* monitors_menu = Gtk::manage(new Gtk::Menu());
         send_to_item->set_submenu(*monitors_menu);
         apply_menu_item_text_color(*send_to_item);
@@ -1393,30 +1551,12 @@ private:
         }
         m_wrench_menu.append(*send_to_item);
 
-        // 3. Add "Fullscreen" toggle item
-        bool is_fullscreen = is_window_fullscreen();
-        auto* fullscreen_item = create_menu_item(is_fullscreen ? "Exit Fullscreen" : "Fullscreen");
-        fullscreen_item->signal_activate().connect([this, is_fullscreen]() {
-            m_window_fullscreen = !is_fullscreen;
-            apply_window_display_settings();
-            save_persisted_display_settings();
-        });
-        m_wrench_menu.append(*fullscreen_item);
-
-        // 4. Add "Touchscreen" submenu
-        auto* touchscreen_item = create_menu_item("Touchscreen");
-        auto* touchscreen_menu = Gtk::manage(new Gtk::Menu());
-        append_touchscreen_items(*touchscreen_menu);
-        touchscreen_item->set_submenu(*touchscreen_menu);
-        apply_menu_item_text_color(*touchscreen_item);
-        m_wrench_menu.append(*touchscreen_item);
-
-        // 5. Add "Dark Mode" toggle item
+        // Theme toggle
         auto* dark_mode_item = create_menu_item(m_dark_mode ? "Light Mode" : "Dark Mode");
         dark_mode_item->signal_activate().connect(sigc::mem_fun(*this, &ControlPanelWindow::toggle_dark_mode));
         m_wrench_menu.append(*dark_mode_item);
 
-        // 6. Add "Quit" item
+        // Quit
         auto* quit_item = create_menu_item("Quit");
         quit_item->signal_activate().connect([this]() {
             quit_application();
@@ -1424,7 +1564,7 @@ private:
         m_wrench_menu.append(*quit_item);
 
         m_wrench_menu.show_all();
-        m_wrench_menu.popup_at_widget(m_wrench_btn, Gdk::GRAVITY_SOUTH_EAST, Gdk::GRAVITY_NORTH_WEST, nullptr);
+        m_wrench_menu.popup_at_widget(m_wrench_btn, Gdk::GRAVITY_NORTH_WEST, Gdk::GRAVITY_SOUTH_WEST, nullptr);
     }
 
     void send_to_monitor(int monitor_idx) {
@@ -1483,13 +1623,11 @@ private:
                 m_persisted_video_path =
                     key_file.get_string("video", "source");
                 if (!m_persisted_video_path.empty()) {
-                    const std::string canonical = resolve_video_source_path(m_persisted_video_path);
-                    if (!canonical.empty() &&
-                        std::none_of(m_video_sources.begin(), m_video_sources.end(),
-                                     [&canonical](const VideoSource& s) { return s.socket_path == canonical; })) {
-                        VideoSource vs{video_source_label(canonical), canonical};
-                        m_video_sources.push_back(vs);
-                        m_explicit_video_sources.push_back(vs);
+                    // Older settings stored only a socket path; select its left eye.
+                    if (m_persisted_video_path.find('#') == std::string::npos) {
+                        auto eyes = stereo_eye_sources(m_persisted_video_path);
+                        m_persisted_video_path = eyes.empty()
+                            ? m_persisted_video_path + "#-1" : video_source_key(eyes.front());
                     }
                 }
             }
@@ -1563,12 +1701,12 @@ private:
                 auto selected = std::find_if(
                     m_video_sources.begin(), m_video_sources.end(),
                     [this](const VideoSource& source) {
-                        return source.socket_path == m_persisted_video_path;
+                        return video_source_key(source) == m_persisted_video_path;
                     });
                 if (selected == m_video_sources.end()) {
                     selected = m_video_sources.begin();
                 }
-                open_video_source(selected->socket_path);
+                open_video_source(*selected);
             }
         }
         return true;
@@ -1609,7 +1747,7 @@ private:
         menu.append(*is_touchscreen_item);
         menu.append(*not_touchscreen_item);
 
-        auto* device_item = create_menu_item("Input device");
+        auto* device_item = create_menu_item("Input Device");
         auto* device_menu = Gtk::manage(new Gtk::Menu());
         append_touchscreen_device_items(*device_menu);
         device_item->set_submenu(*device_menu);
@@ -2047,7 +2185,7 @@ private:
 
     // UI Widgets
     TouchOverlay m_root_overlay;
-    Gtk::Paned m_main_paned;
+    Gtk::Box m_main_box;
     Gtk::Box m_left_pane;
     Gtk::Box m_right_pane;
     Glib::RefPtr<Gtk::GestureMultiPress> m_touch_press_gesture;
@@ -2072,6 +2210,14 @@ private:
     Gtk::Menu m_wrench_menu;
 
     Gtk::Box m_video_area{Gtk::ORIENTATION_VERTICAL};
+    Gtk::Stack m_video_tabs;
+    Gtk::Frame m_annotation_frame;
+    Gtk::Box m_annotation_bar{Gtk::ORIENTATION_HORIZONTAL};
+    Gtk::Box m_annotation_controls{Gtk::ORIENTATION_HORIZONTAL};
+    Gtk::Button m_input_btn;
+    Gtk::ToggleButton m_annotate_btn;
+    Gtk::Menu m_input_menu;
+    std::unique_ptr<dvrk_console::AnnotationPanel> m_annotations;
 
     // UI State & Mappings
     struct ArmRow {
@@ -2163,6 +2309,7 @@ int main(int argc, char* argv[]) {
     if (options.console_override) {
         config.console = options.console_name;
     }
+    config.annotations_enabled = config.annotations_enabled || options.annotations_enabled;
     for (const auto& source : options.video_sources) {
         if (!source.empty()) {
             config.video_sources.push_back(source);
@@ -2178,17 +2325,11 @@ int main(int argc, char* argv[]) {
                       << "@dvrk:role:name form: " << source << std::endl;
             return 1;
         }
-        if (seen_paths.find(abstract_name) == seen_paths.end()) {
-            video_sources.push_back(VideoSource{video_source_label(abstract_name), abstract_name});
-            seen_paths.insert(abstract_name);
-        }
-    }
-
-    std::vector<VideoSource> discovered = scan_available_video_sources();
-    for (const auto& ds : discovered) {
-        if (seen_paths.find(ds.socket_path) == seen_paths.end()) {
-            video_sources.push_back(ds);
-            seen_paths.insert(ds.socket_path);
+        auto eyes = stereo_eye_sources(abstract_name);
+        if (eyes.empty()) eyes.push_back(VideoSource{video_source_label(abstract_name), abstract_name});
+        for (const auto& eye : eyes) {
+            if (seen_paths.insert(video_source_key(eye)).second)
+                video_sources.push_back(eye);
         }
     }
 
@@ -2203,7 +2344,8 @@ int main(int argc, char* argv[]) {
     auto app = Gtk::Application::create("org.dvrk.display.control_panel", Gio::APPLICATION_NON_UNIQUE);
 
     // Create the Window
-    ControlPanelWindow window(node, config.name, config.console, video_sources);
+    ControlPanelWindow window(node, config.name, config.console, video_sources,
+                              config.annotations, config.annotations_enabled);
 
     // Wire up ROS2 spin with GLib main loop (every 20ms)
     dvrk_console::GlibRosExecutor ros_executor(node);

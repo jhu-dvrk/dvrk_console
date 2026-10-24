@@ -90,6 +90,7 @@ add_executable(stereo_display
 )
 add_executable(control_panel
   src/dvrk_console/main_control_panel.cpp
+  src/dvrk_console/annotation_panel.cpp
 )
 
 target_link_libraries(stereo_display
@@ -154,5 +155,23 @@ install(DIRECTORY share/config
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(annotation_model_test tests/annotation_model_test.cpp)
+  target_include_directories(annotation_model_test PRIVATE src/dvrk_console ${CAIRO_INCLUDE_DIRS})
+  target_link_libraries(annotation_model_test ${CAIRO_LIBRARIES})
+  add_test(NAME annotation_model COMMAND annotation_model_test)
+  add_executable(optional_ar_input_test tests/optional_ar_input_test.cpp)
+  target_include_directories(optional_ar_input_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS} ${GTKMM_INCLUDE_DIRS})
+  target_link_libraries(optional_ar_input_test dvrk_console_runtime dvrk_data::dvrk_data rclcpp::rclcpp ${GST_LIBRARIES} ${GTKMM_LIBRARIES})
+  add_test(NAME optional_ar_input COMMAND optional_ar_input_test)
+  set_tests_properties(optional_ar_input PROPERTIES TIMEOUT 25)
+  add_executable(annotation_panel_test tests/annotation_panel_test.cpp src/dvrk_console/annotation_panel.cpp)
+  target_include_directories(annotation_panel_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS} ${GTKMM_INCLUDE_DIRS})
+  target_link_libraries(annotation_panel_test dvrk_console_runtime dvrk_data::dvrk_data rclcpp::rclcpp ${GST_LIBRARIES} ${GTKMM_LIBRARIES})
+  add_test(NAME annotation_panel COMMAND annotation_panel_test)
+  set_tests_properties(annotation_panel PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+endif()
 
 ament_package()

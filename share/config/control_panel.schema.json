@@ -2,10 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "dvrk_console:control_panel@1.0.0",
   "title": "dVRK control panel configuration",
-  "description": "Configuration consumed by dvrk_console control_panel. The executable currently identifies this format by its fields rather than a type property.",
+  "description": "Optional control panel settings. Annotations are off by default; use -a or include an annotations object to enable them.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["video_source"],
   "properties": {
     "name": {
       "type": "string",
@@ -28,7 +27,19 @@
         "description": "Canonical dVRK abstract socket reference."
       },
       "uniqueItems": true,
-      "description": "Preferred @dvrk sockets. Other active sockets are discovered at startup."
+      "description": "Preferred stereo sockets; each appears as separate left and right eye views. Only stereo_source, stereo_alignment and stereo_display overlay sockets are auto-discovered."
+    },
+    "annotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Presence of this object enables annotations; gst_output optionally overrides the output socket. Annotation input is the final stereo_display overlay stream.",
+      "properties": {
+        "gst_output": {
+          "type": "string",
+          "pattern": "^@dvrk:[^:]+:[^:]+$",
+          "default": "@dvrk:control_panel:annotations"
+        }
+      }
     }
   }
 }
