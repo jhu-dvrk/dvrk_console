@@ -511,9 +511,9 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   // the two eye images share one frame; per-eye frames always fill the window.
   const double horizontal_ui_scale =
       is_stereo_layout
-          ? ((eye_width > 0) ? (eye_width - 2.0 * std::abs(static_cast<double>(
-                                                    display_horizontal_offset_px))) /
-                                   eye_width
+          ? ((eye_width > 0) ? std::max(0.1, (eye_width - 2.0 * std::abs(
+                                   static_cast<double>(display_horizontal_offset_px))) /
+                                   eye_width)
                              : 1.0)
           : 1.0;
 
@@ -577,19 +577,10 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
     const double cy_mid = frame_height * 0.5;
     const int n_eyes = is_stereo_layout ? 2 : 1;
     for (int eye_idx = 0; eye_idx < n_eyes; ++eye_idx) {
-      double cx;
-      if (is_stereo_layout) {
-        const double off =
-            (eye_idx == 0)
-                ? -static_cast<double>(display_horizontal_offset_px) / 2.0
-                : static_cast<double>(display_horizontal_offset_px) / 2.0;
-        cx = eye_width * (static_cast<double>(eye_idx) + 0.5) + off;
-      } else {
-        const double sign =
-            (overlay_view == OverlayView::LeftEye) ? -1.0 : 1.0;
-        cx = eye_width * 0.5 +
-             sign * static_cast<double>(display_horizontal_offset_px) / 2.0;
-      }
+      // The grid is a zero-disparity reference in final display coordinates.
+      const double cx = is_stereo_layout
+                            ? eye_width * (static_cast<double>(eye_idx) + 0.5)
+                            : eye_width * 0.5;
       // White circle for aspect ratio calibration
       cairo_new_path(cr);
       cairo_arc(cr, cx, cy_mid, circle_r, 0.0, 2.0 * M_PI);
@@ -648,7 +639,9 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
       static_cast<double>(display_horizontal_offset_px) / 2.0;
     draw_pedal_row(right_baseline_cx, horizontal_ui_scale);
   } else {
-    const double center_cx = static_cast<double>(frame_width) / 2.0;
+    const double sign = overlay_view == OverlayView::LeftEye ? -1.0 : 1.0;
+    const double center_cx = static_cast<double>(frame_width) / 2.0 +
+        sign * static_cast<double>(display_horizontal_offset_px) / 2.0;
     draw_pedal_row(center_cx, 1.0);
   }
 

@@ -4,6 +4,7 @@
   "title": "dVRK stereo display configuration",
   "type": "object",
   "additionalProperties": false,
+  "not": { "required": ["display_horizontal_offset_px", "widget_horizontal_disparity_px"] },
   "required": ["type", "eye_size"],
   "properties": {
     "type": { "const": "dvrk_console:stereo_display@1.0.0" },
@@ -11,7 +12,9 @@
     "dvrk_console_namespace": { "type": "string", "minLength": 1, "default": "console" },
     "overlay_alpha": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
     "preserve_size": { "type": "boolean", "default": true },
-    "display_horizontal_offset_px": { "type": "integer", "default": 0 },
+    "display_horizontal_offset_px": { "type": "integer", "deprecated": true, "description": "Legacy widget offset; use widget_horizontal_disparity_px with the opposite sign." },
+    "display_horizontal_shift_px": { "type": "integer", "default": 0, "description": "Additional signed disparity of the stereo video in final per-eye output pixels. Positive shifts left-eye pixels right and right-eye pixels left." },
+    "widget_horizontal_disparity_px": { "type": "integer", "default": 0, "description": "Signed disparity of fixed per-eye widgets in final per-eye output pixels. Positive appears nearer; zero is the display plane." },
     "gst_input": { "$ref": "#/$defs/gstInput", "description": "Defaults to @dvrk:stereo_alignment:stereo when omitted." },
     "gst_output": { "$ref": "#/$defs/gstOutput" },
     "eye_size": {

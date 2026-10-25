@@ -158,6 +158,14 @@ install(DIRECTORY launch/
 
 if(BUILD_TESTING)
   enable_testing()
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(
+    NAME stereo_display_calibration
+    COMMAND ${CMAKE_COMMAND} -E env
+      "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/../dvrk_data:$ENV{PYTHONPATH}"
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/stereo_display_calibration_test.py
+  )
   add_executable(annotation_model_test tests/annotation_model_test.cpp)
   target_include_directories(annotation_model_test PRIVATE src/dvrk_console ${CAIRO_INCLUDE_DIRS})
   target_link_libraries(annotation_model_test ${CAIRO_LIBRARIES})

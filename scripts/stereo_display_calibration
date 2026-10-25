@@ -1,302 +1,631 @@
 #!/usr/bin/env python3
-"""Interactive calibration tool for the dvrk_console stereo display offset.
-
-This tool previews the live stereo feed from a ``@dvrk:`` abstract socket
-(produced by ``stereo_alignment``) and lets the operator interactively adjust
-the ``display_horizontal_offset_px`` value that controls how far apart the two
-eye windows are shifted on the surgeon's console display.
-
-Run ``stereo_alignment_calibration`` (from ``dvrk_data``) first to calibrate
-camera crop, alignment shifts, and color correction.  Then run this tool to
-calibrate the display offset that positions the stereo image at the surgeon's
-working depth.
-
-The config must contain a root ``gst_input`` field pointing to the
-``stereo_alignment`` output socket, e.g.::
-
-    "gst_input": "@dvrk:stereo_alignment:stereo",
-    "eye_size": "auto"
-"""
+"""Calibrate stereo_display video and HUD disparity from the aligned stereo socket."""
 
 import argparse
+import copy
 import json
-import re
-import select
+import math
+import threading
+import time
 from pathlib import Path
-import sys
-import termios
-import tty
 
 import cv2
 import numpy as np
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Gst", "1.0")
+gi.require_version("GstVideo", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gst, GstVideo, Gtk
+
+Gst.init(None)
 
 from dvrk_data import dvrk_gst_socket as dvrk_gst
 
-KEY_QUIT = "q"
-KEY_FULLSCREEN = "f"
-KEY_OFFSET_DEC = "LEFT"
-KEY_OFFSET_INC = "RIGHT"
-KEY_GRID_TOGGLE = "g"
+
+DEFAULT_INPUT = "@dvrk:stereo_alignment:stereo"
 
 
-class TerminalInput:
-    def __init__(self):
-        self.old_settings = termios.tcgetattr(sys.stdin)
-
-    def __enter__(self):
-        tty.setcbreak(sys.stdin.fileno())
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
-
-    def get_key(self):
-        key = None
-        while select.select([sys.stdin], [], [], 0)[0]:
-            ch = sys.stdin.read(1)
-            if ch == "\x1b":
-                rest = sys.stdin.read(2)
-                if rest == "[D":
-                    key = KEY_OFFSET_DEC
-                elif rest == "[C":
-                    key = KEY_OFFSET_INC
-                continue
-            if ch in ("q", "Q"):
-                key = KEY_QUIT
-            elif ch in ("f", "F"):
-                key = KEY_FULLSCREEN
-            elif ch in ("g", "G"):
-                key = KEY_GRID_TOGGLE
-        return key
+def split_shift(disparity):
+    """Match the integer half-pixel rounding used by stereo_display."""
+    left = (disparity + 1) // 2
+    return left, left - disparity
 
 
-def as_preview_pipeline(source_snippet: str) -> str:
+def shift_eye(image, pixels):
+    """Move pixels within one eye, filling the newly exposed edge with black."""
+    height, width = image.shape[:2]
+    if abs(pixels) >= width:
+        raise ValueError("Eye shift must be smaller than the eye width")
+    output = np.zeros((height, width, image.shape[2]), dtype=image.dtype)
+    if pixels >= 0:
+        output[:, pixels:] = image[:, :width - pixels]
+    else:
+        output[:, :width + pixels] = image[:, -pixels:]
+    return output
+
+
+def draw_reference_icons(image, disparity_px, left_eye):
+    """Draw a small, fixed-state approximation of the production pedal HUD."""
+    height, width = image.shape[:2]
+    radius = max(10, round(height * 0.025))
+    step = round(2.7 * radius)
+    bar_height = round(3.3 * radius)
+    bar = image[height - bar_height:]
+    bar[:] = cv2.addWeighted(bar, 0.55, np.zeros_like(bar), 0.45, 0)
+    left_offset, right_offset = split_shift(disparity_px)
+    center_x = width // 2 + (left_offset if left_eye else right_offset)
+    center_y = height - bar_height // 2
+    labels = ("C", "CAM", "+/-", "BI", "CO")
+    for index, label in enumerate(labels):
+        cx = center_x + (index - 2) * step
+        if cx < -radius or cx >= width + radius:
+            continue
+        fill = (50, 170, 50) if index == 1 else (115, 115, 115)
+        cv2.circle(image, (cx, center_y), radius, fill, -1, cv2.LINE_AA)
+        cv2.circle(image, (cx, center_y), radius, (210, 210, 210), 2, cv2.LINE_AA)
+        font_scale = radius / (26 if len(label) > 2 else 21)
+        (text_width, text_height), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        cv2.putText(image, label, (cx - text_width // 2, center_y + text_height // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (245, 245, 245),
+                    1, cv2.LINE_AA)
+    return image
+
+
+def render_preview(frame, eye_width, eye_height, video_shift, icon_disparity,
+                   show_icons=True):
+    """Apply the runtime video shift before placing final-coordinate HUD icons."""
+    if frame.shape[1] != 2 * eye_width or frame.shape[0] != eye_height:
+        raise ValueError("Stereo frame dimensions changed during calibration")
+    left_shift, right_shift = split_shift(video_shift)
+    left = shift_eye(frame[:, :eye_width], left_shift)
+    right = shift_eye(frame[:, eye_width:], right_shift)
+    if show_icons:
+        draw_reference_icons(left, icon_disparity, True)
+        draw_reference_icons(right, icon_disparity, False)
+    return left, right
+
+
+def legacy_widget_disparity(config, eye_width):
+    """Convert the old widget offset using the runtime's crop scaling."""
+    legacy = int(config["display_horizontal_offset_px"])
+    camera = config.get("camera", {})
+    size = camera.get("size", {})
+    original_width = int(size.get("width", eye_width)) if isinstance(size, dict) else eye_width
+    crop = camera.get("crop", {})
+    crop_width = int(crop.get("width", original_width)) if isinstance(crop, dict) else original_width
+    scale = (original_width / crop_width
+             if config.get("preserve_size", True) and crop_width > 0 else 1.0)
+    scaled = math.copysign(math.floor(abs(legacy * scale) + 0.5), legacy)
+    return -int(scaled)
+
+
+def as_preview_pipeline(source_snippet):
     snippet = source_snippet.strip()
     if "appsink" in snippet:
         return snippet
-    return f"{snippet} ! videoconvert ! appsink drop=true sync=false"
+    return (f"{snippet} ! queue max-size-buffers=1 max-size-time=0 "
+            "max-size-bytes=0 leaky=downstream ! videoconvert "
+            "! video/x-raw,format=BGR ! appsink drop=true sync=false max-buffers=1")
 
 
-def open_capture(source_snippet: str):
+class GstCapture:
+    """Pull frames with a timeout so a stalled socket cannot block the reader."""
+
+    def __init__(self, description):
+        self.description = description
+        self.pipeline = None
+        self.sink = None
+        self.first_frame = None
+        self.reconnect()
+
+    def reconnect(self):
+        self.release()
+        pipeline = Gst.parse_launch(self.description)
+        iterator = pipeline.iterate_recurse()
+        sink = None
+        while True:
+            result, element = iterator.next()
+            if result == Gst.IteratorResult.DONE:
+                break
+            if result == Gst.IteratorResult.RESYNC:
+                iterator.resync()
+                continue
+            if result != Gst.IteratorResult.OK:
+                break
+            if element.get_factory().get_name() == "appsink":
+                sink = element
+                break
+        if sink is None:
+            pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("Preview pipeline must contain an appsink")
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("Could not start preview pipeline")
+        self.pipeline = pipeline
+        self.sink = sink
+
+    def read(self, timeout=0.25):
+        if self.first_frame is not None:
+            frame, self.first_frame = self.first_frame, None
+            return True, frame
+        if self.sink is None:
+            return False, None
+        sample = self.sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
+        if sample is None:
+            return False, None
+        info = GstVideo.VideoInfo.new_from_caps(sample.get_caps())
+        if info is None or info.finfo.name != "BGR":
+            raise RuntimeError("Preview input must be BGR video")
+        buffer = sample.get_buffer()
+        mapped, data = buffer.map(Gst.MapFlags.READ)
+        if not mapped:
+            return False, None
+        try:
+            frame = np.ndarray(
+                (info.height, info.width, 3), dtype=np.uint8,
+                buffer=data.data, offset=info.offset[0],
+                strides=(info.stride[0], 3, 1)).copy()
+        finally:
+            buffer.unmap(data)
+        return True, frame
+
+    def release(self):
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+            self.sink = None
+
+
+def open_capture(source_snippet, timeout=10.0):
     pipeline = as_preview_pipeline(source_snippet)
-    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        msg = (
-            f"Unable to open stereo source with GStreamer backend.\n"
-            f"Pipeline: {pipeline}\n"
-        )
-        m = re.search(r"socket-path=(\S+)", pipeline)
-        socket_path = ("@" + m.group(1)) if m else "<socket>"
-        msg += (
-            f"\nThe abstract socket {socket_path} could not be opened.\n"
-            "Make sure stereo_source and stereo_alignment are running:\n"
-            "  ros2 run dvrk_data stereo_source -c <stereo_source.json>\n"
-            "  ros2 run dvrk_data stereo_alignment -c <stereo_alignment.json>\n"
-            "\nTo list currently active @dvrk sockets:\n"
-            "  ros2 run dvrk_data gscam_socket"
-        )
-        raise RuntimeError(msg)
-    return cap
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            capture = GstCapture(pipeline)
+            while time.monotonic() < deadline:
+                ok, frame = capture.read()
+                if ok:
+                    capture.first_frame = frame
+                    return capture
+                message = capture.pipeline.get_bus().timed_pop_filtered(
+                    0, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+                if message is not None:
+                    last_error = message.parse_error()[0].message if message.type == Gst.MessageType.ERROR else "End of stream"
+                    break
+            capture.release()
+        except (GLib.Error, RuntimeError) as exc:
+            last_error = str(exc)
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"Unable to connect to the aligned stereo input: {last_error or pipeline}")
+
+
+class FrameReader:
+    """Read the socket outside GTK and keep only the newest complete frame."""
+
+    def __init__(self, capture, first_frame):
+        self.capture = capture
+        self.frame = first_frame
+        self.sequence = 0
+        self.received_at = time.monotonic()
+        self.reconnects = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        last_frame_at = self.received_at
+        while not self.stop_event.is_set():
+            try:
+                ok, frame = self.capture.read()
+            except (GLib.Error, RuntimeError, ValueError):
+                ok, frame = False, None
+            if ok and frame is not None:
+                last_frame_at = time.monotonic()
+                with self.lock:
+                    self.frame = frame
+                    self.sequence += 1
+                    self.received_at = last_frame_at
+            elif time.monotonic() - last_frame_at >= 2.0:
+                try:
+                    self.capture.reconnect()
+                    with self.lock:
+                        self.reconnects += 1
+                except (GLib.Error, RuntimeError):
+                    pass
+                last_frame_at = time.monotonic()
+                self.stop_event.wait(0.2)
+
+    def latest(self):
+        with self.lock:
+            return self.frame, self.sequence, self.received_at, self.reconnects
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
+        if not self.thread.is_alive():
+            self.capture.release()
+
+
+class PreviewWindow(Gtk.Window):
+    def __init__(self, title, width=720, height=550):
+        super().__init__(title=title)
+        self.set_default_size(width, height)
+        self.image = Gtk.Image()
+        self.image.set_hexpand(True)
+        self.image.set_vexpand(True)
+        self.add(self.image)
+        self.stretch_fullscreen = False
+        self.connect("delete-event", self._hide_on_close)
+        self.connect("window-state-event", self._window_state_changed)
+
+    def _hide_on_close(self, _window, _event):
+        self.hide()
+        return True
+
+    def _window_state_changed(self, _window, event):
+        self.stretch_fullscreen = bool(event.new_window_state & Gdk.WindowState.FULLSCREEN)
+        return False
+
+    def set_frame(self, bgr):
+        height, width = bgr.shape[:2]
+        allocated = self.image.get_allocation()
+        default_width, default_height = self.get_default_size()
+        available_width = allocated.width if allocated.width > 1 else default_width - 16
+        available_height = allocated.height if allocated.height > 1 else default_height - 70
+        if self.stretch_fullscreen:
+            target_width, target_height = available_width, available_height
+        else:
+            scale = min(available_width / width, available_height / height)
+            target_width, target_height = round(width * scale), round(height * scale)
+        target = (max(1, target_width), max(1, target_height))
+        if target != (width, height):
+            bgr = cv2.resize(bgr, target, interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        data = GLib.Bytes.new(rgb.tobytes())
+        pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(
+            data, GdkPixbuf.Colorspace.RGB, False, 8,
+            target[0], target[1], target[0] * 3)
+        self.image.set_from_pixbuf(pixbuf)
+
+
+class CalibrationWindow(Gtk.Window):
+    def __init__(self, config, path, capture, first_frame):
+        super().__init__(title="dVRK stereo display calibration")
+        self.set_default_size(490, 570)
+        self.connect("delete-event", self._on_close)
+        self.config = config
+        self.path = path
+        self.eye_width = first_frame.shape[1] // 2
+        self.eye_height = first_frame.shape[0]
+        self.reader = FrameReader(capture, first_frame)
+        self.stereo_window = PreviewWindow("Stereo preview (left | right)", 1100, 620)
+        self.left_window = PreviewWindow("Left preview")
+        self.right_window = PreviewWindow("Right preview")
+        for window in (self.stereo_window, self.left_window, self.right_window):
+            window.connect("key-press-event", self._on_key_press)
+        self.fullscreen_preview = False
+        self._closing = False
+        self._setup_ui()
+        self.saved_config = copy.deepcopy(config)
+        self.last_drawn_sequence = -1
+        self.preview_dirty = True
+        self.timer_id = GLib.timeout_add(16, self.refresh_preview)
+        self.refresh_preview()
+
+    @staticmethod
+    def _section(title):
+        frame = Gtk.Frame(label=title)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        box.set_border_width(10)
+        frame.add(box)
+        return frame, box
+
+    def _adjustment_row(self, box, label, value, callback):
+        box.pack_start(Gtk.Label(label=label, xalign=0), False, False, 0)
+        adjustment = Gtk.Adjustment(
+            value=value, lower=-self.eye_width + 1, upper=self.eye_width - 1,
+            step_increment=1, page_increment=10, page_size=0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        minus = Gtk.Button(label="−")
+        minus.set_size_request(40, 40)
+        minus.connect("clicked", lambda _button: adjustment.set_value(adjustment.get_value() - 1))
+        row.pack_start(minus, False, False, 0)
+        scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment)
+        scale.set_draw_value(False)
+        scale.set_hexpand(True)
+        row.pack_start(scale, True, True, 0)
+        plus = Gtk.Button(label="+")
+        plus.set_size_request(40, 40)
+        plus.connect("clicked", lambda _button: adjustment.set_value(adjustment.get_value() + 1))
+        row.pack_start(plus, False, False, 0)
+        spin = Gtk.SpinButton(adjustment=adjustment, climb_rate=1, digits=0)
+        spin.set_width_chars(6)
+        row.pack_start(spin, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        adjustment.connect("value-changed", callback)
+        return adjustment
+
+    def _setup_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        root.set_border_width(12)
+        self.add(root)
+
+        frame, box = self._section("Stereo source")
+        for text in (f"Input: {self.config.get('gst_input', DEFAULT_INPUT)}",
+                     f"Detected per eye: {self.eye_width} × {self.eye_height}",
+                     f"Configuration: {self.path}"):
+            label = Gtk.Label(label=text, xalign=0)
+            label.set_line_wrap(True)
+            label.set_max_width_chars(50)
+            box.pack_start(label, False, False, 0)
+        root.pack_start(frame, False, False, 0)
+
+        frame, box = self._section("Preview")
+        self.side_by_side = Gtk.CheckButton(label="Side-by-side video")
+        sinks = self.config.get("sinks", [])
+        self.side_by_side.set_active(
+            not any(sink in sinks for sink in ("separate", "glimages")))
+        self.side_by_side.connect("toggled", self._show_previews)
+        box.pack_start(self.side_by_side, False, False, 0)
+        self.show_icons = Gtk.CheckButton(label="Show HUD icons")
+        self.show_icons.set_active(True)
+        self.show_icons.connect("toggled", lambda _button: self.refresh_preview(force=True))
+        box.pack_start(self.show_icons, False, False, 0)
+        preview_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        show = Gtk.Button(label="Show previews")
+        show.connect("clicked", self._show_previews)
+        preview_actions.pack_start(show, True, True, 0)
+        self.fullscreen_button = Gtk.Button(label="Fullscreen previews")
+        self.fullscreen_button.connect("clicked", self._toggle_fullscreen)
+        preview_actions.pack_start(self.fullscreen_button, True, True, 0)
+        box.pack_start(preview_actions, False, False, 0)
+        root.pack_start(frame, False, False, 0)
+
+        frame, box = self._section("Disparity (final per-eye pixels)")
+        self.video_shift = self._adjustment_row(
+            box, "Video display shift", self.config.get("display_horizontal_shift_px", 0),
+            self._setting_changed)
+        self.widget_shift = self._adjustment_row(
+            box, "Widget disparity", self.config.get("widget_horizontal_disparity_px", 0),
+            self._setting_changed)
+        reset = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for label, adjustment in (("Reset video shift", self.video_shift),
+                                  ("Reset widget depth", self.widget_shift)):
+            button = Gtk.Button(label=label)
+            button.connect("clicked", lambda _button, target=adjustment: target.set_value(0))
+            reset.pack_start(button, True, True, 0)
+        box.pack_start(reset, False, False, 0)
+        root.pack_start(frame, False, False, 0)
+
+        self.status = Gtk.Label(xalign=0)
+        self.status.set_line_wrap(True)
+        root.pack_start(self.status, False, False, 0)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for label, callback in (("Save", self.save),
+                                ("Save & quit", self.save_and_quit),
+                                ("Quit", self._quit_clicked)):
+            button = Gtk.Button(label=label)
+            button.set_size_request(-1, 42)
+            button.connect("clicked", callback)
+            actions.pack_start(button, True, True, 0)
+        root.pack_start(actions, False, False, 0)
+        self._bind_arrows(self)
+
+    def _bind_arrows(self, widget):
+        # Focused scales, spin buttons, and buttons otherwise consume arrow keys.
+        widget.connect("key-press-event", self._on_key_press)
+        if isinstance(widget, Gtk.Container):
+            for child in widget.get_children():
+                self._bind_arrows(child)
+
+    def _on_key_press(self, _widget, event):
+        if event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
+            return False
+        moves = {
+            Gdk.KEY_Left: (self.video_shift, -1),
+            Gdk.KEY_KP_Left: (self.video_shift, -1),
+            Gdk.KEY_Right: (self.video_shift, 1),
+            Gdk.KEY_KP_Right: (self.video_shift, 1),
+            Gdk.KEY_Up: (self.widget_shift, 1),
+            Gdk.KEY_KP_Up: (self.widget_shift, 1),
+            Gdk.KEY_Down: (self.widget_shift, -1),
+            Gdk.KEY_KP_Down: (self.widget_shift, -1),
+        }
+        move = moves.get(event.keyval)
+        if move is None:
+            return False
+        adjustment, delta = move
+        adjustment.set_value(adjustment.get_value() + delta)
+        return True
+
+    def _setting_changed(self, _adjustment):
+        # Repeated keys and slider changes should not render additional frames
+        # inside their GTK event handlers.  The next refresh uses the latest values.
+        self.preview_dirty = True
+
+    def _show_previews(self, _button=None):
+        if self.side_by_side.get_active():
+            self.left_window.hide()
+            self.right_window.hide()
+            self.stereo_window.show_all()
+        else:
+            self.stereo_window.hide()
+            self.left_window.show_all()
+            self.right_window.show_all()
+        if self.fullscreen_preview:
+            for window in self._visible_previews():
+                window.fullscreen()
+        self.refresh_preview(force=True)
+
+    def _visible_previews(self):
+        return ((self.stereo_window,) if self.side_by_side.get_active()
+                else (self.left_window, self.right_window))
+
+    def show_previews(self):
+        self.stereo_window.move(510, 40)
+        self.left_window.move(510, 40)
+        self.right_window.move(550, 80)
+        self._show_previews()
+
+    def _toggle_fullscreen(self, _button):
+        self.fullscreen_preview = not self.fullscreen_preview
+        for window in self._visible_previews():
+            if self.fullscreen_preview:
+                window.fullscreen()
+            else:
+                window.unfullscreen()
+        self.fullscreen_button.set_label(
+            "Exit fullscreen" if self.fullscreen_preview else "Fullscreen previews")
+
+    def refresh_preview(self, force=False):
+        if not hasattr(self, "video_shift"):
+            return True
+        frame, sequence, received_at, reconnects = self.reader.latest()
+        if frame is None or (sequence == self.last_drawn_sequence
+                             and not self.preview_dirty and not force):
+            if time.monotonic() - received_at > 0.75:
+                self.status.set_text(
+                    f"Waiting for video: {time.monotonic() - received_at:.1f} s "
+                    f"since the last frame; reconnects: {reconnects}")
+            return True
+        try:
+            left, right = render_preview(
+                frame, self.eye_width, self.eye_height,
+                int(self.video_shift.get_value()), int(self.widget_shift.get_value()),
+                self.show_icons.get_active())
+        except ValueError as exc:
+            self.status.set_text(str(exc))
+            return True
+        if self.side_by_side.get_active():
+            self.stereo_window.set_frame(np.hstack((left, right)))
+        else:
+            self.left_window.set_frame(left)
+            self.right_window.set_frame(right)
+        self.last_drawn_sequence = sequence
+        self.preview_dirty = False
+        self.status.set_text(
+            f"Video shift: {int(self.video_shift.get_value()):+d} px; "
+            f"widget disparity: {int(self.widget_shift.get_value()):+d} px. "
+            "Positive disparity moves left pixels right.")
+        return True
+
+    def configured_values(self):
+        config = copy.deepcopy(self.config)
+        config["display_horizontal_shift_px"] = int(self.video_shift.get_value())
+        config["widget_horizontal_disparity_px"] = int(self.widget_shift.get_value())
+        config.pop("display_horizontal_offset_px", None)
+        return config
+
+    def save(self, _button=None):
+        config = self.configured_values()
+        try:
+            self.path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            dialog = Gtk.MessageDialog(
+                transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.CLOSE, text=f"Could not save calibration: {exc}")
+            dialog.run()
+            dialog.destroy()
+            return False
+        self.config = config
+        self.saved_config = copy.deepcopy(config)
+        self.status.set_text(f"Saved {self.path}")
+        return True
+
+    def save_and_quit(self, _button=None):
+        if self.save():
+            self._closing = True
+            self.close()
+
+    def _quit_clicked(self, _button):
+        self.close()
+
+    def _on_close(self, _window, _event):
+        if not self._closing and self.configured_values() != self.saved_config:
+            dialog = Gtk.MessageDialog(
+                transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.NONE, text="Save changes before quitting?")
+            dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                               "Discard", Gtk.ResponseType.NO,
+                               "Save", Gtk.ResponseType.YES)
+            answer = dialog.run()
+            dialog.destroy()
+            if answer in (Gtk.ResponseType.CANCEL, Gtk.ResponseType.DELETE_EVENT):
+                return True
+            if answer == Gtk.ResponseType.YES and not self.save():
+                return True
+        GLib.source_remove(self.timer_id)
+        self.reader.stop()
+        for window in (self.stereo_window, self.left_window, self.right_window):
+            window.destroy()
+        Gtk.main_quit()
+        return False
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description=(
-            "Interactive dvrk_console stereo display offset calibration tool. "
-            "Reads the pre-aligned stereo stream from root gst_input and lets "
-            "the operator tune display_horizontal_offset_px interactively."
-        )
-    )
-    parser.add_argument("-c", "--config", required=True, help="Path to dvrk_console JSON config")
-    parser.add_argument("-s", "--split", action="store_true", help="Split stereo view in two windows")
+        description="Calibrate stereo display video shift and widget disparity.")
+    parser.add_argument("-c", "--config", required=True,
+                        help="Path to dvrk_console stereo_display JSON config")
     return parser.parse_args()
-
-
-def interactive_display_tune(config, split_mode=False):
-    gst_input = config.get("gst_input", "").strip()
-    if not gst_input:
-        raise RuntimeError(
-            "gst_input is required but not set in the config.\n"
-            "Add a root 'gst_input' field, e.g.:\n"
-            '  "gst_input": "@dvrk:stereo_alignment:stereo", '
-            '"eye_size": "auto"}'
-        )
-
-    eye_size = config.get("eye_size", config.get("camera", {}).get("size", {}))
-    if eye_size == "auto":
-        eye_size = {}
-    eye_w = int(eye_size.get("width", 0))
-    eye_h = int(eye_size.get("height", 0))
-    stereo_snippet = dvrk_gst.build_input(
-        gst_input, dvrk_gst.ROLE_STEREO_ALIGNMENT, eye_w * 2, eye_h)
-    print(f"Using stereo input: {gst_input}")
-    cap = open_capture(stereo_snippet)
-
-    # Probe the first frame to confirm dimensions
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        raise RuntimeError("Unable to read first frame from stereo socket")
-    if eye_w <= 0:
-        eye_w = frame.shape[1] // 2
-    if eye_h <= 0:
-        eye_h = frame.shape[0]
-
-    display_horizontal_offset = int(config.get("display_horizontal_offset_px", 0))
-    show_grid = True
-
-    window_name = "stereo_preview"
-    left_window_name = "left_preview"
-    right_window_name = "right_preview"
-
-    if split_mode:
-        cv2.namedWindow(left_window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
-        cv2.resizeWindow(left_window_name, max(640, eye_w), max(360, eye_h))
-        cv2.namedWindow(right_window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
-        cv2.resizeWindow(right_window_name, max(640, eye_w), max(360, eye_h))
-    else:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL)
-        cv2.resizeWindow(window_name, max(960, 2 * eye_w), max(360, eye_h))
-
-    print(f"Eye size: {eye_w}x{eye_h}")
-    print("Controls: left/right arrows=display_offset  g=toggle grid  f=fullscreen  q=quit")
-
-    grid_rows = 3
-    grid_cols = 4
-    grid_colors = [tuple(np.random.randint(0, 256, 3).tolist()) for _ in range(grid_rows * grid_cols)]
-    preview_fullscreen = False
-
-    with TerminalInput() as term:
-        while True:
-            ok, stereo_frame = cap.read()
-            if not ok or stereo_frame is None:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok, stereo_frame = cap.read()
-            if not ok or stereo_frame is None:
-                continue
-
-            left_preview = stereo_frame[:eye_h, :eye_w].copy()
-            right_preview = stereo_frame[:eye_h, eye_w:eye_w * 2].copy()
-
-            if left_preview.size == 0 or right_preview.size == 0:
-                continue
-
-            if show_grid:
-                curr_h, curr_w = left_preview.shape[:2]
-                center_x = curr_w // 2
-                square_size = int(curr_h * 0.05)
-                span_w = int(curr_w * 0.8)
-                span_h = int(curr_h * 0.8)
-                padding_x = (span_w - grid_cols * square_size) // (grid_cols - 1)
-                padding_y = (span_h - grid_rows * square_size) // (grid_rows - 1)
-                grid_w = grid_cols * square_size + (grid_cols - 1) * padding_x
-                grid_h = grid_rows * square_size + (grid_rows - 1) * padding_y
-
-                for eye_idx, preview_eye in enumerate([left_preview, right_preview]):
-                    sign = -1 if eye_idx == 0 else 1
-                    cx = int(center_x + sign * display_horizontal_offset / 2.0)
-                    start_x = cx - grid_w // 2
-                    start_y = curr_h // 2 - grid_h // 2
-                    for r in range(grid_rows):
-                        for c in range(grid_cols):
-                            x = start_x + c * (square_size + padding_x)
-                            y = start_y + r * (square_size + padding_y)
-                            color = grid_colors[r * grid_cols + c]
-                            cv2.rectangle(preview_eye, (x, y), (x + square_size, y + square_size), color, -1)
-                for eye_idx, preview_eye in enumerate([left_preview, right_preview]):
-                    sign = -1 if eye_idx == 0 else 1
-                    cx = int(center_x + sign * display_horizontal_offset / 2.0)
-                    cy = curr_h // 2
-                    radius = int(curr_h * 0.4)
-                    cv2.circle(preview_eye, (cx, cy), radius, (255, 255, 255), 4)
-
-            info = f"display_offset:{display_horizontal_offset}  grid:{'on' if show_grid else 'off'}"
-            controls = "arrows:display_offset  g:grid  f:fullscreen  q:quit"
-
-            if split_mode:
-                cv2.putText(left_preview, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.putText(left_preview, controls, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-                cv2.imshow(left_window_name, left_preview)
-                cv2.imshow(right_window_name, right_preview)
-            else:
-                preview = np.hstack([left_preview, right_preview])
-                cv2.putText(preview, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.putText(preview, controls, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-                display = preview
-                if preview_fullscreen:
-                    try:
-                        _, _, win_w, win_h = cv2.getWindowImageRect(window_name)
-                        if win_w > 0 and win_h > 0:
-                            display = cv2.resize(preview, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
-                    except cv2.error:
-                        pass
-                cv2.imshow(window_name, display)
-
-            cv2.waitKey(1)
-            key = term.get_key()
-
-            if key == KEY_QUIT:
-                break
-            elif key == KEY_FULLSCREEN:
-                preview_fullscreen = not preview_fullscreen
-                mode = cv2.WINDOW_FULLSCREEN if preview_fullscreen else cv2.WINDOW_NORMAL
-                aspect = cv2.WINDOW_FREERATIO if preview_fullscreen else cv2.WINDOW_KEEPRATIO
-                if split_mode:
-                    for wn in [left_window_name, right_window_name]:
-                        cv2.setWindowProperty(wn, cv2.WND_PROP_FULLSCREEN, mode)
-                        cv2.setWindowProperty(wn, cv2.WND_PROP_ASPECT_RATIO, aspect)
-                else:
-                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, mode)
-                    cv2.setWindowProperty(window_name, cv2.WND_PROP_ASPECT_RATIO, aspect)
-            elif key == KEY_OFFSET_DEC:
-                display_horizontal_offset -= 2
-            elif key == KEY_OFFSET_INC:
-                display_horizontal_offset += 2
-            elif key == KEY_GRID_TOGGLE:
-                show_grid = not show_grid
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    return int(display_horizontal_offset)
 
 
 def main():
     args = parse_args()
     path = Path(args.config)
-    if not path.exists():
-        print(f"Error: config file does not exist: {path}")
+    if not path.is_file():
+        print(f"Error: configuration file does not exist: {path}")
         return 1
-
-    with path.open("r", encoding="utf-8") as f:
-        config = json.load(f)
-
+    if not Gtk.init_check([])[0]:
+        print("Error: GTK could not open a display")
+        return 1
     try:
-        split_mode = args.split or any(
-            s in config.get("sinks", []) for s in ("separate", "glimages")
-        )
-        display_horizontal_offset = interactive_display_tune(
-            config, split_mode=split_mode
-        )
-    except RuntimeError as exc:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        source = config.get("gst_input", DEFAULT_INPUT).strip()
+        if not source:
+            raise ValueError("gst_input must be a nonempty stereo socket or GStreamer source")
+        eye_size = config.get("eye_size", "auto")
+        if eye_size == "auto":
+            eye_size = {}
+        if not isinstance(eye_size, dict):
+            raise ValueError("eye_size must be 'auto' or an object with width and height")
+        expected_width = int(eye_size.get("width", 0))
+        expected_height = int(eye_size.get("height", 0))
+        source_pipeline = dvrk_gst.build_input(
+            source, dvrk_gst.ROLE_STEREO_ALIGNMENT,
+            2 * expected_width, expected_height)
+        capture = open_capture(source_pipeline)
+        ok, first_frame = capture.read()
+        if not ok or first_frame is None:
+            raise RuntimeError("Unable to read the first aligned stereo frame")
+        height, stereo_width = first_frame.shape[:2]
+        if stereo_width < 2 or stereo_width % 2:
+            raise RuntimeError("Aligned stereo frame width must be positive and even")
+        if ((expected_width and stereo_width != 2 * expected_width)
+                or (expected_height and height != expected_height)):
+            raise RuntimeError(
+                f"Configured eye_size does not match aligned input {stereo_width // 2}×{height}")
+        if "display_horizontal_offset_px" in config and "widget_horizontal_disparity_px" not in config:
+            config["widget_horizontal_disparity_px"] = legacy_widget_disparity(
+                config, stereo_width // 2)
+        if abs(int(config.get("display_horizontal_shift_px", 0))) >= stereo_width // 2:
+            raise ValueError("display_horizontal_shift_px must be smaller than the eye width")
+        window = CalibrationWindow(config, path, capture, first_frame)
+    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        if "capture" in locals():
+            capture.release()
         print(f"Error: {exc}")
         return 1
-
-    while True:
-        decision = input(f"Save display_horizontal_offset_px={display_horizontal_offset} to {path}? [y/N]: ").strip().lower()
-        if decision in ("y", "yes"):
-            break
-        if decision in ("", "n", "no"):
-            print("Changes discarded.")
-            return 0
-        print("Please answer with y/yes or n/no.")
-
-    config["display_horizontal_offset_px"] = display_horizontal_offset
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        f.write(json.dumps(config, indent=2) + "\n")
-
-    print(f"Wrote {path}")
+    window.show_all()
+    window.show_previews()
+    Gtk.main()
     return 0
 
 

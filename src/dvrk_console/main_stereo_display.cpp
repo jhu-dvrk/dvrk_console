@@ -200,7 +200,7 @@ void attach_ar_timestamp_probes(GstElement *pipeline) {
 }
 
 void attach_timestamp_probes(GstElement *pipeline) {
-  for (const char *name : {"left_ar_mix", "right_ar_mix", "mix", "__stereo_comp__", "stereo_ar_mix"}) {
+  for (const char *name : {"left_ar_mix", "right_ar_mix", "mix", "__display_shift_mix__", "__stereo_comp__", "stereo_ar_mix"}) {
     GstElement *mixer = gst_bin_get_by_name(GST_BIN(pipeline), name);
     if (!mixer) continue;
     const bool camera_only = std::string(name) == "left_ar_mix" || std::string(name) == "right_ar_mix" || std::string(name) == "stereo_ar_mix";
@@ -446,6 +446,40 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
         normalized_stereo_caps + " ! glupload ! glcolorconvert";
   }
 
+  // Shift each eye inside its own bounded canvas.  videobox fills exposed
+  // pixels with black and prevents either eye from spilling into the other.
+  // This precedes the stereo annotation mixer so touch-panel coordinates
+  // continue to refer to pixels in the final display image.
+  if (stereo.display_horizontal_shift_px != 0) {
+    const int shift = stereo.display_horizontal_shift_px;
+    const int left_shift = (shift >= 0) ? (shift + 1) / 2 : shift / 2;
+    const int right_shift = left_shift - shift;
+    const auto eye_branch = [&](const bool left) {
+      const int eye_shift = left ? left_shift : right_shift;
+      return std::string(" __display_shift_in__. ! queue max-size-buffers=2 leaky=downstream") +
+          " ! videocrop left=" + std::to_string(left ? 0 : eye_w) +
+          " right=" + std::to_string(left ? eye_w : 0) +
+          " ! videobox fill=black left=" + std::to_string(-eye_shift) +
+          " right=" + std::to_string(eye_shift) +
+          " ! video/x-raw,format=RGBA,width=" + std::to_string(eye_w) +
+          ",height=" + std::to_string(eye_h) +
+          " ! glupload ! __display_shift_mix__.sink_" + (left ? "0 " : "1 ");
+    };
+    presentation_chain +=
+        " ! gldownload ! videoconvert ! video/x-raw,format=RGBA,width=" +
+        std::to_string(stereo_w) + ",height=" + std::to_string(eye_h) +
+        " ! tee name=__display_shift_in__ " + eye_branch(true) +
+        eye_branch(false) +
+        " glvideomixer name=__display_shift_mix__ background=1"
+        " sink_0::xpos=0 sink_0::width=" + std::to_string(eye_w) +
+        " sink_0::height=" + std::to_string(eye_h) +
+        " sink_1::xpos=" + std::to_string(eye_w) +
+        " sink_1::width=" + std::to_string(eye_w) +
+        " sink_1::height=" + std::to_string(eye_h) +
+        " ! video/x-raw(memory:GLMemory),width=" +
+        std::to_string(stereo_w) + ",height=" + std::to_string(eye_h);
+  }
+
   const bool has_stereo_socket_output = !stereo.stereo.gst_output.empty();
 
   const bool has_display_output = has_side_by_side || has_separate;
@@ -525,7 +559,7 @@ build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_ove
             " sink_1::width=" +
             std::to_string(eye_w) + " sink_1::height=" +
             std::to_string(stereo_h) + " sink_1::sizing-policy=1";
-        const int disp = stereo.display_horizontal_offset_px;
+        const int disp = -stereo.widget_horizontal_disparity_px;
         const int disp_half_lo = disp / 2;
         const int disp_half_hi = disp - disp_half_lo;
         for (int i = 0; i < n_extra_streams; ++i) {
@@ -927,6 +961,10 @@ int main(int argc, char *argv[]) {
                 cfg.original_width, cfg.original_height);
   }
 
+  if (cfg.legacy_display_horizontal_offset) {
+    RCLCPP_WARN(node->get_logger(),
+                "display_horizontal_offset_px is deprecated; use widget_horizontal_disparity_px with the opposite sign");
+  }
   RCLCPP_INFO(node->get_logger(), "Loaded viewer config: %s", cfg.name.c_str());
   console_name = cfg.dvrk_console_namespace;
   overlay_state->overlay_alpha = cfg.overlay_alpha;
@@ -938,14 +976,24 @@ int main(int argc, char *argv[]) {
             ? static_cast<double>(cfg.original_width) /
                   static_cast<double>(cfg.crop_width)
             : 1.0;
-    overlay_state->display_horizontal_offset_px = static_cast<int>(
-        std::round(cfg.display_horizontal_offset_px * offset_scale));
+    overlay_state->display_horizontal_offset_px = cfg.legacy_display_horizontal_offset
+        ? static_cast<int>(std::round(cfg.display_horizontal_offset_px * offset_scale))
+        : -cfg.widget_horizontal_disparity_px;
   }
   if (cfg.original_width <= 0 || cfg.original_height <= 0) {
     RCLCPP_ERROR(node->get_logger(),
                  "Config '%s' must provide positive "
                  "per-eye width and height via stereo.eye_size",
                  cfg.name.c_str());
+    rclcpp::shutdown();
+    return 1;
+  }
+
+  if (cfg.display_horizontal_shift_px <= -cfg.original_width ||
+      cfg.display_horizontal_shift_px >= cfg.original_width) {
+    RCLCPP_ERROR(node->get_logger(),
+                 "display_horizontal_shift_px must be smaller than the per-eye width (%d)",
+                 cfg.original_width);
     rclcpp::shutdown();
     return 1;
   }
