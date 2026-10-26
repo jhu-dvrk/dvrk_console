@@ -40,10 +40,14 @@
 #include "gst_pipeline_runtime.hpp"
 #include "optional_ar_input.hpp"
 #include <dvrk_data/cpu_timestamp_meta.hpp>
-#include <dvrk_data/stereo_timestamp_meta.hpp>
+#include <dvrk_data/latest_video.hpp>
+#include "frame_timing_panel.hpp"
+#include "stereo_pipeline.hpp"
 #include <dvrk_data/stereo_common.hpp>
 
 namespace {
+using dvrk_console::build_pipeline_string;
+using dvrk_console::is_valid_sink;
 
 struct CommandLineOptions {
   std::string config_file;
@@ -120,6 +124,7 @@ bool validate_pipeline(const std::string &stream, const rclcpp::Logger &logger,
 
   const std::vector<std::string> candidates = {stream, stream + " ! fakesink"};
 
+  std::string parse_error;
   for (const auto &candidate : candidates) {
     GError *error = nullptr;
     GstElement *pipeline = gst_parse_launch(candidate.c_str(), &error);
@@ -130,6 +135,7 @@ bool validate_pipeline(const std::string &stream, const rclcpp::Logger &logger,
       return true;
     }
 
+    if (parse_error.empty()) parse_error = error->message;
     g_error_free(error);
     if (pipeline != nullptr) {
       gst_object_unref(pipeline);
@@ -138,8 +144,8 @@ bool validate_pipeline(const std::string &stream, const rclcpp::Logger &logger,
 
   RCLCPP_ERROR(logger,
                "Unable to parse GStreamer stream for '%s'; expected either a "
-               "full pipeline or a source snippet",
-               name.c_str());
+               "full pipeline or a source snippet: %s",
+               name.c_str(), parse_error.c_str());
   return false;
 }
 
@@ -162,52 +168,7 @@ GstPadProbeReturn overlay_timestamp_probe_cb(GstPad *, GstPadProbeInfo *info, gp
   return GST_PAD_PROBE_OK;
 }
 
-GstPadProbeReturn ar_timestamp_probe_cb(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
-  (void)user_data;
-  if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
-    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!gst_buffer_is_writable(buf)) {
-      buf = gst_buffer_make_writable(buf);
-      GST_PAD_PROBE_INFO_DATA(info) = buf;
-    }
-    GstElement *element = gst_pad_get_parent_element(pad);
-    if (element) {
-      GstClockTime running_time = gst_element_get_current_running_time(element);
-      if (GST_CLOCK_TIME_IS_VALID(running_time)) {
-        GST_BUFFER_PTS(buf) = running_time;
-        GST_BUFFER_DTS(buf) = GST_CLOCK_TIME_NONE;
-      }
-      gst_object_unref(element);
-    }
-  }
-  return GST_PAD_PROBE_OK;
-}
-
-void attach_ar_timestamp_probes(GstElement *pipeline) {
-  const std::vector<std::string> names = {"left_ar_src", "right_ar_src", "stereo_ar_src"};
-  for (const auto &name : names) {
-    GstElement *element = gst_bin_get_by_name(GST_BIN(pipeline), name.c_str());
-    if (element) {
-      GstPad *pad = gst_element_get_static_pad(element, "src");
-      if (pad) {
-        gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-                          ar_timestamp_probe_cb, nullptr, nullptr);
-        gst_object_unref(pad);
-      }
-      gst_object_unref(element);
-    }
-  }
-}
-
 void attach_timestamp_probes(GstElement *pipeline) {
-  for (const char *name : {"left_ar_mix", "right_ar_mix", "mix", "__display_shift_mix__", "__stereo_comp__", "stereo_ar_mix"}) {
-    GstElement *mixer = gst_bin_get_by_name(GST_BIN(pipeline), name);
-    if (!mixer) continue;
-    const bool camera_only = std::string(name) == "left_ar_mix" || std::string(name) == "right_ar_mix" || std::string(name) == "stereo_ar_mix";
-    if (!dc_attach_mixer_timestamps(mixer, camera_only))
-      std::cerr << "Cannot preserve selected-frame metadata for " << name << std::endl;
-    gst_object_unref(mixer);
-  }
   for (const char *name : {"stereo_overlay", "stereo_overlay_unixfd", "__stereo_output_q__"}) {
     GstElement *element = gst_bin_get_by_name(GST_BIN(pipeline), name);
     if (!element) continue;
@@ -228,452 +189,6 @@ gboolean on_sigint(gpointer) {
 }
 
 // Removed local on_bus_message in favor of dc_stereo::on_bus_message
-
-// Helper: ensure a pixel count is even (round down)
-static int make_even(int v) { return v & ~1; }
-
-static bool is_side_by_side_sink(const std::string &sink) {
-  return sink == "side_by_side" || sink == "glimage";
-}
-
-static bool is_separate_sink(const std::string &sink) {
-  return sink == "separate" || sink == "glimages";
-}
-
-static bool is_headless_sink(const std::string &sink) {
-  return sink == "headless";
-}
-
-static bool is_valid_sink(const std::string &sink) {
-  return is_side_by_side_sink(sink) || is_separate_sink(sink) || is_headless_sink(sink);
-}
-
-std::string
-build_pipeline_string(const dvrk_data::AppConfig &stereo, const bool include_overlay) {
-  const int eye_w = stereo.original_width;
-  const int eye_h = stereo.original_height;
-  const int stereo_w = 2 * eye_w;
-
-  const bool has_side_by_side =
-      std::any_of(stereo.sinks.begin(), stereo.sinks.end(), is_side_by_side_sink);
-  const bool has_separate =
-      std::any_of(stereo.sinks.begin(), stereo.sinks.end(), is_separate_sink);
-  const bool has_headless =
-      std::any_of(stereo.sinks.begin(), stereo.sinks.end(), is_headless_sink);
-  (void)has_headless;
-
-  const auto &es = stereo.pip_gst_inputs;
-  const int n_mono = static_cast<int>(es.monos.size());
-  const int n_stereo = static_cast<int>(es.stereos.size());
-  const int n_extra_streams = n_mono + n_stereo;
-  const bool has_extra = n_extra_streams > 0 && es.scale > 0.01;
-  const bool has_ar = stereo.ar.enabled &&
-                      (!stereo.ar.left.gst_input.empty() ||
-                       !stereo.ar.right.gst_input.empty());
-  const bool has_stereo_ar = stereo.ar.enabled && !stereo.ar.stereo.gst_input.empty();
-  const bool split_stereo_for_presentation = has_extra || has_ar;
-
-  int stereo_h = eye_h;
-  int extra_h = 0;
-  int gap_px = 0;
-  if (has_extra) {
-    gap_px = dvrk_data::AppConfig::gap_px;
-    stereo_h =
-        make_even(static_cast<int>(std::round(eye_h * (1.0 - es.scale))));
-    stereo_h = std::max(2, std::min(eye_h - 2, stereo_h));
-    extra_h = eye_h - stereo_h;
-  }
-
-  int slot_w = 0;
-  if (has_extra && n_extra_streams > 0) {
-    slot_w =
-        make_even((eye_w - (n_extra_streams - 1) * gap_px) / n_extra_streams);
-    slot_w = std::max(2, slot_w);
-  }
-  const int mono_h = has_extra ? std::max(2, extra_h - gap_px) : 0;
-
-  std::string extra_chains;
-  if (has_extra) {
-    for (int i = 0; i < n_mono; ++i) {
-      extra_chains += es.monos[i] +
-          " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
-          " leaky=downstream"
-          " ! identity sync=true single-segment=true"
-          " ! tee name=__extra_mono" + std::to_string(i) + "__  ";
-    }
-    for (int i = 0; i < n_stereo; ++i) {
-      extra_chains += es.stereos[i].left +
-          " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
-          " leaky=downstream"
-          " ! identity sync=true single-segment=true"
-          " ! tee name=__extra_stereo_left" + std::to_string(i) + "__  ";
-      extra_chains += es.stereos[i].right +
-          " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
-          " leaky=downstream"
-          " ! identity sync=true single-segment=true"
-          " ! tee name=__extra_stereo_right" + std::to_string(i) + "__  ";
-    }
-  }
-
-  auto append_extra_branches = [&](std::string &chain,
-                                   const std::string &mix_name,
-                                   int start_sink, bool is_left_eye) {
-    for (int i = 0; i < n_mono; ++i) {
-      const int sink_idx = start_sink + i;
-      chain += " __extra_mono" + std::to_string(i) + "__. "
-               "! queue max-size-buffers=2 leaky=downstream"
-               " ! glupload ! " + mix_name + ".sink_" +
-               std::to_string(sink_idx) + " ";
-    }
-    for (int i = 0; i < n_stereo; ++i) {
-      const int sink_idx = start_sink + n_mono + i;
-      const std::string tee_name =
-          is_left_eye ? "__extra_stereo_left" : "__extra_stereo_right";
-      chain += " " + tee_name + std::to_string(i) + "__. "
-               "! queue max-size-buffers=2 leaky=downstream"
-               " ! glupload ! " + mix_name + ".sink_" +
-               std::to_string(sink_idx) + " ";
-    }
-  };
-
-  std::string input_chain;
-  std::string presentation_chain;
-  const std::string normalized_stereo_caps =
-      " ! videoconvert ! video/x-raw,width=" + std::to_string(stereo_w) +
-      ",height=" + std::to_string(eye_h);
-
-  if (split_stereo_for_presentation) {
-    input_chain =
-        stereo.stereo.gst_input +
-        " ! queue name=__stereo_src_q__ max-size-buffers=8 "
-        "max-size-time=0 max-size-bytes=0 leaky=downstream" +
-        normalized_stereo_caps + " ! tee name=__clean_stereo__ ";
-
-    std::string left_chain =
-        " __clean_stereo__. ! queue max-size-buffers=2 leaky=downstream"
-        " ! videocrop left=0 right=" + std::to_string(eye_w) +
-        " top=0 bottom=0 ! video/x-raw,width=" + std::to_string(eye_w) +
-        ",height=" + std::to_string(eye_h) + " ! glupload";
-
-    if (stereo.ar.enabled && !stereo.ar.left.gst_input.empty()) {
-      left_chain += " ! left_ar_mix.sink_0 ";
-      left_chain +=
-          "glvideomixer name=left_ar_mix background=1 force-live=true"
-          " sink_0::zorder=1 sink_0::xpos=0 sink_0::ypos=0"
-          " sink_0::width=" +
-          std::to_string(eye_w) + " sink_0::height=" +
-          std::to_string(eye_h) +
-          " sink_1::zorder=2 sink_1::xpos=0 sink_1::ypos=0"
-          " sink_1::width=" +
-          std::to_string(eye_w) + " sink_1::height=" +
-          std::to_string(eye_h) + " ";
-      std::string alpha_str;
-      if (stereo.ar.use_color_key) {
-        alpha_str = " ! alpha method=custom target-r=" +
-                    std::to_string(stereo.ar.color_key_r) +
-                    " target-g=" + std::to_string(stereo.ar.color_key_g) +
-                    " target-b=" + std::to_string(stereo.ar.color_key_b);
-      }
-      left_chain +=
-          dvrk_console::OptionalARInput::source("left_ar_input") + " ! identity name=left_ar_src"
-          " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
-          " leaky=downstream"
-          " ! videoconvert ! video/x-raw,format=RGBA" +
-          alpha_str + " ! glupload ! left_ar_mix.sink_1 ";
-      left_chain +=
-          "left_ar_mix. ! video/x-raw(memory:GLMemory),width=" +
-          std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
-          " ! mix.sink_0";
-    } else {
-      left_chain += " ! mix.sink_0";
-    }
-
-    std::string right_chain =
-        " __clean_stereo__. ! queue max-size-buffers=2 leaky=downstream"
-        " ! videocrop left=" + std::to_string(eye_w) +
-        " right=0 top=0 bottom=0 ! video/x-raw,width=" +
-        std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
-        " ! glupload";
-
-    if (stereo.ar.enabled && !stereo.ar.right.gst_input.empty()) {
-      right_chain += " ! right_ar_mix.sink_0 ";
-      right_chain +=
-          "glvideomixer name=right_ar_mix background=1 force-live=true"
-          " sink_0::zorder=1 sink_0::xpos=0 sink_0::ypos=0"
-          " sink_0::width=" +
-          std::to_string(eye_w) + " sink_0::height=" +
-          std::to_string(eye_h) +
-          " sink_1::zorder=2 sink_1::xpos=0 sink_1::ypos=0"
-          " sink_1::width=" +
-          std::to_string(eye_w) + " sink_1::height=" +
-          std::to_string(eye_h) + " ";
-      std::string alpha_str;
-      if (stereo.ar.use_color_key) {
-        alpha_str = " ! alpha method=custom target-r=" +
-                    std::to_string(stereo.ar.color_key_r) +
-                    " target-g=" + std::to_string(stereo.ar.color_key_g) +
-                    " target-b=" + std::to_string(stereo.ar.color_key_b);
-      }
-      right_chain +=
-          dvrk_console::OptionalARInput::source("right_ar_input") + " ! identity name=right_ar_src"
-          " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0"
-          " leaky=downstream"
-          " ! videoconvert ! video/x-raw,format=RGBA" +
-          alpha_str + " ! glupload ! right_ar_mix.sink_1 ";
-      right_chain +=
-          "right_ar_mix. ! video/x-raw(memory:GLMemory),width=" +
-          std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
-          " ! mix.sink_1";
-    } else {
-      right_chain += " ! mix.sink_1";
-    }
-
-    input_chain += left_chain + right_chain;
-    presentation_chain =
-        " glvideomixer name=mix background=1"
-        " sink_0::xpos=0 sink_0::width=" +
-        std::to_string(eye_w) + " sink_0::height=" + std::to_string(eye_h) +
-        " sink_1::xpos=" + std::to_string(eye_w) +
-        " sink_1::width=" + std::to_string(eye_w) +
-        " sink_1::height=" + std::to_string(eye_h) +
-        " ! video/x-raw(memory:GLMemory),width=" + std::to_string(stereo_w) +
-        ",height=" + std::to_string(eye_h);
-  } else {
-    presentation_chain =
-        stereo.stereo.gst_input +
-        " ! queue name=__stereo_src_q__ max-size-buffers=8 "
-        "max-size-time=0 max-size-bytes=0 leaky=downstream" +
-        normalized_stereo_caps + " ! glupload ! glcolorconvert";
-  }
-
-  // Shift each eye inside its own bounded canvas.  videobox fills exposed
-  // pixels with black and prevents either eye from spilling into the other.
-  // This precedes the stereo annotation mixer so touch-panel coordinates
-  // continue to refer to pixels in the final display image.
-  if (stereo.display_horizontal_shift_px != 0) {
-    const int shift = stereo.display_horizontal_shift_px;
-    const int left_shift = (shift >= 0) ? (shift + 1) / 2 : shift / 2;
-    const int right_shift = left_shift - shift;
-    const auto eye_branch = [&](const bool left) {
-      const int eye_shift = left ? left_shift : right_shift;
-      return std::string(" __display_shift_in__. ! queue max-size-buffers=2 leaky=downstream") +
-          " ! videocrop left=" + std::to_string(left ? 0 : eye_w) +
-          " right=" + std::to_string(left ? eye_w : 0) +
-          " ! videobox fill=black left=" + std::to_string(-eye_shift) +
-          " right=" + std::to_string(eye_shift) +
-          " ! video/x-raw,format=RGBA,width=" + std::to_string(eye_w) +
-          ",height=" + std::to_string(eye_h) +
-          " ! glupload ! __display_shift_mix__.sink_" + (left ? "0 " : "1 ");
-    };
-    presentation_chain +=
-        " ! gldownload ! videoconvert ! video/x-raw,format=RGBA,width=" +
-        std::to_string(stereo_w) + ",height=" + std::to_string(eye_h) +
-        " ! tee name=__display_shift_in__ " + eye_branch(true) +
-        eye_branch(false) +
-        " glvideomixer name=__display_shift_mix__ background=1"
-        " sink_0::xpos=0 sink_0::width=" + std::to_string(eye_w) +
-        " sink_0::height=" + std::to_string(eye_h) +
-        " sink_1::xpos=" + std::to_string(eye_w) +
-        " sink_1::width=" + std::to_string(eye_w) +
-        " sink_1::height=" + std::to_string(eye_h) +
-        " ! video/x-raw(memory:GLMemory),width=" +
-        std::to_string(stereo_w) + ",height=" + std::to_string(eye_h);
-  }
-
-  const bool has_stereo_socket_output = !stereo.stereo.gst_output.empty();
-
-  const bool has_display_output = has_side_by_side || has_separate;
-  const int stereo_branches = (has_display_output ? 1 : 0) +
-                              (has_stereo_socket_output ? 1 : 0);
-
-  std::string output_chain = presentation_chain;
-  if (has_stereo_ar) {
-    output_chain += " ! stereo_ar_mix.sink_0 "
-        "glvideomixer name=stereo_ar_mix background=1 force-live=true"
-        " sink_0::zorder=1 sink_0::xpos=0 sink_0::ypos=0"
-        " sink_0::width=" + std::to_string(stereo_w) +
-        " sink_0::height=" + std::to_string(eye_h) +
-        " sink_1::zorder=2 sink_1::xpos=0 sink_1::ypos=0"
-        " sink_1::width=" + std::to_string(stereo_w) +
-        " sink_1::height=" + std::to_string(eye_h) + " " +
-        dvrk_console::OptionalARInput::source("stereo_ar_input") +
-        " ! identity name=stereo_ar_src ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream"
-        " ! videoconvert ! video/x-raw,format=RGBA ! glupload ! stereo_ar_mix.sink_1 "
-        "stereo_ar_mix. ! video/x-raw(memory:GLMemory),width=" +
-        std::to_string(stereo_w) + ",height=" + std::to_string(eye_h);
-  }
-  if (stereo_branches > 0) {
-    if (stereo_branches > 1) {
-      output_chain += " ! tee name=__stereo_out__ ";
-    }
-
-    if (has_display_output) {
-      if (stereo_branches > 1) {
-        output_chain +=
-            " __stereo_out__. ! queue max-size-buffers=1 leaky=downstream";
-      } else {
-        output_chain += " ! queue max-size-buffers=1 leaky=downstream";
-      }
-
-      if (has_extra) {
-        if (include_overlay) {
-          output_chain +=
-              " ! gldownload ! videoconvert ! cairooverlay name=stereo_overlay"
-              " ! videoconvert ! video/x-raw,format=RGBA,width=" +
-              std::to_string(stereo_w) + ",height=" + std::to_string(eye_h) +
-              " ! tee name=__stereo_split__ ";
-        } else {
-          output_chain +=
-              " ! gldownload ! videoconvert ! video/x-raw,format=RGBA,width=" +
-              std::to_string(stereo_w) + ",height=" + std::to_string(eye_h) +
-              " ! tee name=__stereo_split__ ";
-        }
-        output_chain +=
-            " __stereo_split__. ! queue max-size-buffers=1 leaky=downstream"
-            " ! videocrop left=0 right=" +
-            std::to_string(eye_w) +
-            " top=0 bottom=0 ! video/x-raw,format=RGBA,width=" +
-            std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
-            " ! glupload ! __stereo_comp__.sink_0 ";
-        output_chain +=
-            " __stereo_split__. ! queue max-size-buffers=1 leaky=downstream"
-            " ! videocrop left=" +
-            std::to_string(eye_w) +
-            " right=0 top=0 bottom=0 ! video/x-raw,format=RGBA,width=" +
-            std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
-            " ! glupload ! __stereo_comp__.sink_1 ";
-        append_extra_branches(output_chain, "__stereo_comp__", 2, true);
-        append_extra_branches(output_chain, "__stereo_comp__",
-                              2 + n_extra_streams, false);
-
-        std::string comp_desc =
-            "glvideomixer name=__stereo_comp__ background=1"
-            " sink_0::xpos=0 sink_0::ypos=0"
-            " sink_0::width=" +
-            std::to_string(eye_w) + " sink_0::height=" +
-            std::to_string(stereo_h) +
-            " sink_0::sizing-policy=1"
-            " sink_1::xpos=" +
-            std::to_string(eye_w) +
-            " sink_1::ypos=0"
-            " sink_1::width=" +
-            std::to_string(eye_w) + " sink_1::height=" +
-            std::to_string(stereo_h) + " sink_1::sizing-policy=1";
-        const int disp = -stereo.widget_horizontal_disparity_px;
-        const int disp_half_lo = disp / 2;
-        const int disp_half_hi = disp - disp_half_lo;
-        for (int i = 0; i < n_extra_streams; ++i) {
-          const int base_x = i * (slot_w + gap_px);
-          const int left_x =
-              std::max(0, std::min(eye_w - slot_w, base_x - disp_half_lo));
-          const int right_x = std::max(
-              eye_w, std::min(stereo_w - slot_w,
-                              eye_w + base_x + disp_half_hi));
-          comp_desc +=
-              " sink_" + std::to_string(2 + i) +
-              "::xpos=" + std::to_string(left_x) +
-              " sink_" + std::to_string(2 + i) +
-              "::ypos=" + std::to_string(stereo_h + gap_px) +
-              " sink_" + std::to_string(2 + i) +
-              "::width=" + std::to_string(slot_w) +
-              " sink_" + std::to_string(2 + i) +
-              "::height=" + std::to_string(mono_h) +
-              " sink_" + std::to_string(2 + i) + "::sizing-policy=1" +
-              " sink_" + std::to_string(2 + i) + "::yalign=0.0";
-          comp_desc +=
-              " sink_" + std::to_string(2 + n_extra_streams + i) +
-              "::xpos=" + std::to_string(right_x) +
-              " sink_" + std::to_string(2 + n_extra_streams + i) +
-              "::ypos=" + std::to_string(stereo_h + gap_px) +
-              " sink_" + std::to_string(2 + n_extra_streams + i) +
-              "::width=" + std::to_string(slot_w) +
-              " sink_" + std::to_string(2 + n_extra_streams + i) +
-              "::height=" + std::to_string(mono_h) +
-              " sink_" + std::to_string(2 + n_extra_streams + i) +
-              "::sizing-policy=1" +
-              " sink_" + std::to_string(2 + n_extra_streams + i) +
-              "::yalign=0.0";
-        }
-        output_chain += " " + comp_desc;
-        output_chain += " ! video/x-raw(memory:GLMemory),width=" +
-                        std::to_string(stereo_w) + ",height=" +
-                        std::to_string(eye_h) + " ! glcolorconvert";
-      } else {
-        if (include_overlay) {
-          output_chain += " ! gldownload ! videoconvert ! cairooverlay "
-                          "name=stereo_overlay ! glupload";
-        }
-        output_chain += " ! glcolorconvert";
-      }
-
-      if (has_side_by_side || has_separate) {
-        output_chain += " ! tee name=__stereo_display_out__";
-      }
-
-      if (has_side_by_side) {
-        output_chain +=
-            " __stereo_display_out__. ! queue max-size-buffers=1 "
-            "leaky=downstream ! gtkglsink sync=false "
-            "force-aspect-ratio=false name=__stereo_sink__";
-      }
-
-      if (has_separate) {
-        output_chain +=
-            " __stereo_display_out__. ! queue max-size-buffers=1 "
-            "leaky=downstream ! gldownload ! videoconvert "
-            "! video/x-raw,format=RGBA,width=" +
-            std::to_string(stereo_w) + ",height=" + std::to_string(eye_h) +
-            " ! tee name=__stereo_eye_split__"
-            " __stereo_eye_split__. ! queue max-size-buffers=1 "
-            "leaky=downstream ! videocrop left=0 right=" +
-            std::to_string(eye_w) +
-            " top=0 bottom=0 ! video/x-raw,format=RGBA,width=" +
-            std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
-            " ! glupload ! glcolorconvert ! gtkglsink "
-            "name=__left_eye_sink__ sync=false force-aspect-ratio=false"
-            " __stereo_eye_split__. ! queue max-size-buffers=1 "
-            "leaky=downstream ! videocrop left=" +
-            std::to_string(eye_w) +
-            " right=0 top=0 bottom=0 ! video/x-raw,format=RGBA,width=" +
-            std::to_string(eye_w) + ",height=" + std::to_string(eye_h) +
-            " ! glupload ! glcolorconvert ! gtkglsink "
-            "name=__right_eye_sink__ sync=false force-aspect-ratio=false";
-      }
-    }
-
-    if (has_stereo_socket_output) {
-      const std::string abstract_name =
-          dvrk_gst::resolve(stereo.stereo.gst_output);
-      if (stereo_branches > 1) {
-        output_chain +=
-            " __stereo_out__. ! queue max-size-buffers=2 max-size-time=0 "
-            "max-size-bytes=0 leaky=downstream ! ";
-      } else {
-        output_chain +=
-            " ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
-            "leaky=downstream ! ";
-      }
-      output_chain += "gldownload ! videoconvert ";
-      if (include_overlay) {
-        output_chain += "! cairooverlay name=stereo_overlay_unixfd ";
-      }
-      output_chain +=
-          "! videoconvert ! video/x-raw,format=I420"
-          " ! queue name=__stereo_output_q__"
-          " max-size-buffers=2 max-size-time=0 max-size-bytes=0 "
-          "leaky=downstream ! " + dvrk_gst::build_sink(abstract_name);
-    }
-
-  } else {
-    if (include_overlay) {
-      output_chain +=
-          " ! gldownload ! videoconvert ! cairooverlay name=stereo_overlay";
-    }
-    output_chain += " ! fakesink sync=false";
-  }
-
-  return extra_chains + input_chain + " " + output_chain;
-}
 
 class ControlWindow : public Gtk::Window {
 public:
@@ -706,6 +221,7 @@ public:
     m_vbox.pack_start(m_btn_eye_labels, Gtk::PACK_SHRINK);
 
     m_vbox.pack_start(m_display_outputs.widget(), Gtk::PACK_SHRINK);
+    m_vbox.pack_start(m_frame_timing, Gtk::PACK_SHRINK);
 
     if (!m_cfg.pip_gst_inputs.monos.empty() || !m_cfg.pip_gst_inputs.stereos.empty()) {
       m_scale_label.set_text("Extra Streams:");
@@ -749,7 +265,7 @@ public:
     m_vbox.pack_start(m_btn_quit, Gtk::PACK_SHRINK);
 
     const int height = 180 + (m_scale_visible ? 35 : 0);
-    set_default_size(260, height);
+    set_default_size(570, height + 170);
     add_events(Gdk::KEY_PRESS_MASK);
     show_all_children();
     setup_display_windows(pipeline);
@@ -759,6 +275,7 @@ public:
 
   void setup_display_windows(GstElement *pipeline) {
     m_pipeline = pipeline;
+    m_frame_timing.attach(pipeline);
     std::vector<dvrk_console::DisplayOutputPanel::SinkDescriptor> sinks;
     const std::vector<std::string> sink_names = {
         "__left_eye_sink__", "__right_eye_sink__", "__stereo_sink__"};
@@ -827,6 +344,7 @@ protected:
   Gtk::Label m_scale_label;
   Gtk::Scale m_scale_slider{Gtk::ORIENTATION_HORIZONTAL};
   dvrk_console::DisplayOutputPanel m_display_outputs;
+  dvrk_console::FrameTimingPanel m_frame_timing;
 };
 } // namespace
 
@@ -1030,7 +548,8 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  pipeline_string = build_pipeline_string(app_cfg, overlay_available);
+  std::vector<dvrk_video::LatestVideoSpec> mixer_specs;
+  pipeline_string = build_pipeline_string(app_cfg, overlay_available, &mixer_specs);
 
   const std::string camera_topic = "/" + console_name + "/camera";
   const std::string clutch_topic = "/" + console_name + "/clutch";
@@ -1371,8 +890,14 @@ int main(int argc, char *argv[]) {
   };
   start_ar_inputs();
 
+  dvrk_video::LatestVideoMixers latest;
+  std::string latest_error;
+  if (!latest.start(pipeline, mixer_specs, latest_error)) {
+    RCLCPP_ERROR(node->get_logger(), "%s", latest_error.c_str());
+    pipeline_runtime.stop(); gst_object_unref(pipeline); rclcpp::shutdown(); return 1;
+  }
   attach_timestamp_probes(pipeline);
-  attach_ar_timestamp_probes(pipeline);
+
 
   // Helper: attach cairo overlay signals to all overlay elements in a pipeline.
   // Used for both initial setup and after pipeline rebuild.
@@ -1428,8 +953,9 @@ int main(int argc, char *argv[]) {
     // parsing fails, so a bad runtime setting cannot blank the display.
     dvrk_data::AppConfig candidate_cfg = cfg;
     candidate_cfg.pip_gst_inputs.scale = new_scale;
+    std::vector<dvrk_video::LatestVideoSpec> new_specs;
     const std::string new_pipeline_str =
-        build_pipeline_string(candidate_cfg, overlay_available);
+        build_pipeline_string(candidate_cfg, overlay_available, &new_specs);
 
     GError *rebuild_error = nullptr;
     GstElement *new_pipeline =
@@ -1446,7 +972,7 @@ int main(int argc, char *argv[]) {
     // Re-attach overlay signals
     attach_overlays(new_pipeline);
     attach_timestamp_probes(new_pipeline);
-    attach_ar_timestamp_probes(new_pipeline);
+
     if (!dvrk_video::add_caps_monitor(new_pipeline, "__stereo_src_q__",
                                       &stereo_caps_monitor)) {
       RCLCPP_ERROR(node->get_logger(), "Cannot monitor rebuilt stereo input caps");
@@ -1460,9 +986,16 @@ int main(int argc, char *argv[]) {
     stereo_ar.stop();
     pipeline_runtime.stop();
     gst_element_set_state(pipeline, GST_STATE_NULL);
+    latest.stop();
     gst_object_unref(pipeline);
     pipeline = new_pipeline;
     cfg = candidate_cfg;
+    mixer_specs = std::move(new_specs);
+    if (!latest.start(pipeline, mixer_specs, latest_error)) {
+      RCLCPP_ERROR(node->get_logger(), "%s", latest_error.c_str());
+      g_app->quit();
+      return;
+    }
     start_ar_inputs();
 
     if (!pipeline_runtime.start(pipeline, node.get(), "stereo_display")) {
@@ -1501,6 +1034,7 @@ int main(int argc, char *argv[]) {
   if (pipeline) {
     gst_element_send_event(pipeline, gst_event_new_eos());
     gst_element_set_state(pipeline, GST_STATE_NULL);
+    latest.stop();
     gst_object_unref(pipeline);
   }
 

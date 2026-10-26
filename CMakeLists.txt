@@ -44,6 +44,7 @@ target_link_libraries(dvrk_console_ui dvrk_data::dvrk_data)
 target_link_libraries(dvrk_console_ui ${GTKMM_LIBRARIES})
 
 add_library(dvrk_console_runtime
+  src/dvrk_console/stereo_pipeline.cpp
   src/dvrk_console/glib_ros_executor.cpp
   src/dvrk_console/gst_pipeline_runtime.cpp
 )
@@ -166,6 +167,15 @@ if(BUILD_TESTING)
       ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/stereo_display_calibration_test.py
   )
+  add_executable(stereo_pipeline_test tests/stereo_pipeline_test.cpp)
+  target_include_directories(stereo_pipeline_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS})
+  target_link_libraries(stereo_pipeline_test dvrk_console_runtime dvrk_data::dvrk_data ${GST_LIBRARIES})
+  add_test(NAME stereo_pipeline COMMAND stereo_pipeline_test)
+  set_tests_properties(stereo_pipeline PROPERTIES TIMEOUT 20)
+  add_executable(frame_timing_test tests/frame_timing_test.cpp)
+  target_include_directories(frame_timing_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS})
+  target_link_libraries(frame_timing_test dvrk_data::dvrk_data ${GST_LIBRARIES})
+  add_test(NAME frame_timing COMMAND frame_timing_test)
   add_executable(annotation_model_test tests/annotation_model_test.cpp)
   target_include_directories(annotation_model_test PRIVATE src/dvrk_console ${CAIRO_INCLUDE_DIRS})
   target_link_libraries(annotation_model_test ${CAIRO_LIBRARIES})
