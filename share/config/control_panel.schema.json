@@ -27,7 +27,7 @@
         "description": "Canonical dVRK abstract socket reference."
       },
       "uniqueItems": true,
-      "description": "Preferred stereo sockets; each appears as separate left and right eye views. Only stereo_source, stereo_alignment and stereo_display overlay sockets are auto-discovered."
+      "description": "Preferred stereo sockets; each appears as separate left and right eye views. Only stereo_source, stereo_alignment, stereo_rectify and stereo_display overlay sockets are auto-discovered."
     },
     "annotations": {
       "type": "object",

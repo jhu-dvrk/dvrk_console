@@ -43,6 +43,7 @@
 #include <dvrk_data/latest_video.hpp>
 #include "frame_timing_panel.hpp"
 #include "stereo_pipeline.hpp"
+#include "stereo_display_input.hpp"
 #include <dvrk_data/stereo_common.hpp>
 
 namespace {
@@ -51,6 +52,7 @@ using dvrk_console::is_valid_sink;
 
 struct CommandLineOptions {
   std::string config_file;
+  std::string gst_hint = dvrk_gst::ROLE_STEREO_ALIGNMENT;
   bool show_grid = false;
 };
 
@@ -58,9 +60,11 @@ static Glib::RefPtr<Gtk::Application> g_app;
 
 void print_usage(const char *executable) {
   std::cerr << "Usage: " << executable
-            << " [-c <config.json>] [--grid]" << std::endl;
+            << " [-c <config.json>] [--gst-hint <role-or-socket>] [--grid]" << std::endl;
   std::cerr << "  -c       Configuration file (defaults to ./stereo_display.json)"
             << std::endl;
+  std::cerr << "  --gst-hint <role-or-socket>  Default input role (stereo_alignment) or full socket;"
+            << " config gst_input takes precedence" << std::endl;
   std::cerr << "  --grid   Display calibration grid overlay for display alignment"
             << std::endl;
   std::cerr << "  ROS parameters: ecm_roll_min_degrees (default -90), "
@@ -70,6 +74,7 @@ void print_usage(const char *executable) {
 
 bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
   bool seen_config = false;
+  bool seen_hint = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--ros-args") {
@@ -85,6 +90,22 @@ bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
       }
       options.config_file = argv[++i];
       seen_config = true;
+      continue;
+    }
+
+    if (arg == "--gst-hint") {
+      if (seen_hint || i + 1 >= argc || std::string(argv[i + 1]).rfind("-", 0) == 0) {
+        std::cerr << "Error: --gst-hint requires exactly one role or socket value." << std::endl;
+        return false;
+      }
+      options.gst_hint = argv[++i];
+      seen_hint = true;
+      try {
+        (void)dvrk_console::stereo_display_input("", options.gst_hint);
+      } catch (const std::invalid_argument &e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return false;
+      }
       continue;
     }
 
@@ -443,8 +464,9 @@ int main(int argc, char *argv[]) {
 
   std::string pipeline_string;
 
-  if (cfg.stereo.gst_input.empty())
-    cfg.stereo.gst_input = dvrk_gst::make(dvrk_gst::ROLE_STEREO_ALIGNMENT, "stereo");
+  cfg.stereo.gst_input = dvrk_console::stereo_display_input(
+      cfg.stereo.gst_input, options.gst_hint);
+  RCLCPP_INFO(node->get_logger(), "Stereo input: %s", cfg.stereo.gst_input.c_str());
   if (cfg.stereo.gst_input.empty()) {
     RCLCPP_ERROR(node->get_logger(), "Config '%s' must define root gst_input",
                  cfg.name.c_str());

@@ -15,7 +15,7 @@
     "display_horizontal_offset_px": { "type": "integer", "deprecated": true, "description": "Legacy widget offset; use widget_horizontal_disparity_px with the opposite sign." },
     "display_horizontal_shift_px": { "type": "integer", "default": 0, "description": "Additional signed disparity of the stereo video in final per-eye output pixels. Positive shifts left-eye pixels right and right-eye pixels left." },
     "widget_horizontal_disparity_px": { "type": "integer", "default": 0, "description": "Signed disparity of fixed per-eye widgets in final per-eye output pixels. Positive appears nearer; zero is the display plane." },
-    "gst_input": { "$ref": "#/$defs/gstInput", "description": "Defaults to @dvrk:stereo_alignment:stereo when omitted." },
+    "gst_input": { "$ref": "#/$defs/gstInput", "description": "Defaults to @dvrk:stereo_alignment:stereo when omitted; --gst-hint changes this default. An explicit gst_input takes precedence." },
     "gst_output": { "$ref": "#/$defs/gstOutput" },
     "eye_size": {
       "description": "Use 'auto' to derive each eye from the negotiated side-by-side input caps at startup, or specify a fixed per-eye size.",

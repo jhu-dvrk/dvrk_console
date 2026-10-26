@@ -4,6 +4,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from dvrk_data.stereo_pipeline_selection import select_processor, output_socket, color_config
 
 
 DEFAULT_SOURCE_CONFIG = "stereo_source.json"
@@ -39,11 +40,14 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration("source_config").perform(context),
         DEFAULT_SOURCE_CONFIG,
     )
-    alignment_config_path = resolve_config_path(
+    executable, processor_config_path = select_processor(
         base_dir,
+        LaunchConfiguration("processor").perform(context),
         LaunchConfiguration("alignment_config").perform(context),
-        DEFAULT_ALIGNMENT_CONFIG,
+        LaunchConfiguration("rectify_config").perform(context),
     )
+    processor_config_path = str(processor_config_path)
+    colors = color_config(base_dir, LaunchConfiguration("color_config").perform(context))
     display_config_path = resolve_config_path(
         base_dir,
         LaunchConfiguration("display_config").perform(context),
@@ -52,7 +56,7 @@ def launch_setup(context, *args, **kwargs):
 
     missing = [
         path
-        for path in (source_config_path, alignment_config_path, display_config_path)
+        for path in (source_config_path, processor_config_path, display_config_path)
         if not os.path.exists(path)
     ]
     if missing:
@@ -66,25 +70,32 @@ def launch_setup(context, *args, **kwargs):
         arguments=["-c", source_config_path],
     )
 
-    alignment_node = Node(
+    processor_arguments = ["-c", processor_config_path, "-i",
+                           output_socket(source_config_path, "@dvrk:stereo_source:stereo")]
+    if colors:
+        processor_arguments += ["--color-adjustment", str(colors)]
+    processor_node = Node(
         package="dvrk_data",
-        executable="stereo_alignment",
-        name="stereo_alignment",
+        executable=executable,
+        name=executable,
         output="screen",
-        arguments=["-c", alignment_config_path],
+        arguments=processor_arguments,
     )
+    default_socket = "@dvrk:" + executable + ":stereo"
+    processor_output = output_socket(processor_config_path, default_socket)
+    hint = executable if processor_output == default_socket else processor_output
 
     display_node = Node(
         package="dvrk_console",
         executable="stereo_display",
         name="stereo_display",
         output="screen",
-        arguments=["-c", display_config_path],
+        arguments=["-c", display_config_path, "--gst-hint", hint],
     )
 
     return [
         source_node,
-        TimerAction(period=2.0, actions=[alignment_node]),
+        TimerAction(period=2.0, actions=[processor_node]),
         TimerAction(period=4.0, actions=[display_node]),
     ]
 
@@ -110,6 +121,22 @@ def generate_launch_description():
             "source_config",
             default_value=DEFAULT_SOURCE_CONFIG,
             description="dvrk_data stereo_source config filename or absolute path.",
+        ),
+        DeclareLaunchArgument(
+            "processor",
+            default_value="auto",
+            choices=["auto", "alignment", "rectify"],
+            description="Geometry processor; auto requires exactly one geometry config.",
+        ),
+        DeclareLaunchArgument(
+            "rectify_config",
+            default_value="stereo_rectify.json",
+            description="dvrk_data stereo_rectify config filename or absolute path.",
+        ),
+        DeclareLaunchArgument(
+            "color_config",
+            default_value="",
+            description="Optional shared color adjustment config filename or absolute path.",
         ),
         DeclareLaunchArgument(
             "alignment_config",

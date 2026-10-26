@@ -167,6 +167,12 @@ if(BUILD_TESTING)
       ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/stereo_display_calibration_test.py
   )
+  add_executable(stereo_display_input_test tests/stereo_display_input_test.cpp)
+  target_include_directories(stereo_display_input_test PRIVATE src/dvrk_console)
+  target_link_libraries(stereo_display_input_test dvrk_data::dvrk_data)
+  add_test(NAME stereo_display_input COMMAND stereo_display_input_test)
+  add_test(NAME stereo_video_launch COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/stereo_video_launch_test.py)
   add_executable(stereo_pipeline_test tests/stereo_pipeline_test.cpp)
   target_include_directories(stereo_pipeline_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS})
   target_link_libraries(stereo_pipeline_test dvrk_console_runtime dvrk_data::dvrk_data ${GST_LIBRARIES})

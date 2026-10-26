@@ -223,6 +223,7 @@ std::vector<VideoSource> stereo_eye_sources(const std::string &name) {
     std::string role;
     if (name == "@dvrk:stereo_source:stereo") role = "stereo_source";
     else if (name == "@dvrk:stereo_alignment:stereo") role = "stereo_alignment";
+    else if (name == "@dvrk:stereo_rectify:stereo") role = "stereo_rectify";
     else if (name == "@dvrk:stereo_display:overlay") role = "overlay";
     else return {};
     return {{"stereo::left (" + role + ")", name, 0},
