@@ -15,6 +15,7 @@ find_package(crtk_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(dvrk_data REQUIRED)
 find_package(PkgConfig REQUIRED)
 
@@ -96,6 +97,7 @@ add_executable(control_panel
 
 target_link_libraries(stereo_display
   rclcpp::rclcpp
+  diagnostic_msgs::diagnostic_msgs
   geometry_msgs::geometry_msgs
   sensor_msgs::sensor_msgs
   std_msgs::std_msgs
@@ -180,12 +182,17 @@ if(BUILD_TESTING)
   set_tests_properties(stereo_pipeline PROPERTIES TIMEOUT 20)
   add_executable(frame_timing_test tests/frame_timing_test.cpp)
   target_include_directories(frame_timing_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS})
-  target_link_libraries(frame_timing_test dvrk_data::dvrk_data ${GST_LIBRARIES})
+  target_link_libraries(frame_timing_test dvrk_data::dvrk_data diagnostic_msgs::diagnostic_msgs ${GST_LIBRARIES})
   add_test(NAME frame_timing COMMAND frame_timing_test)
   add_executable(annotation_model_test tests/annotation_model_test.cpp)
   target_include_directories(annotation_model_test PRIVATE src/dvrk_console ${CAIRO_INCLUDE_DIRS})
   target_link_libraries(annotation_model_test ${CAIRO_LIBRARIES})
   add_test(NAME annotation_model COMMAND annotation_model_test)
+  add_executable(widget_disparity_test tests/widget_disparity_test.cpp)
+  target_include_directories(widget_disparity_test PRIVATE src/dvrk_console)
+  target_link_libraries(widget_disparity_test dvrk_data::dvrk_data rclcpp::rclcpp std_msgs::std_msgs)
+  add_test(NAME widget_disparity COMMAND widget_disparity_test)
+  set_tests_properties(widget_disparity PROPERTIES TIMEOUT 15)
   add_executable(optional_ar_input_test tests/optional_ar_input_test.cpp)
   target_include_directories(optional_ar_input_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS} ${GTKMM_INCLUDE_DIRS})
   target_link_libraries(optional_ar_input_test dvrk_console_runtime dvrk_data::dvrk_data rclcpp::rclcpp ${GST_LIBRARIES} ${GTKMM_LIBRARIES})
@@ -193,7 +200,7 @@ if(BUILD_TESTING)
   set_tests_properties(optional_ar_input PROPERTIES TIMEOUT 25)
   add_executable(annotation_panel_test tests/annotation_panel_test.cpp src/dvrk_console/annotation_panel.cpp)
   target_include_directories(annotation_panel_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS} ${GTKMM_INCLUDE_DIRS})
-  target_link_libraries(annotation_panel_test dvrk_console_runtime dvrk_data::dvrk_data rclcpp::rclcpp ${GST_LIBRARIES} ${GTKMM_LIBRARIES})
+  target_link_libraries(annotation_panel_test dvrk_console_runtime dvrk_data::dvrk_data rclcpp::rclcpp std_msgs::std_msgs ${GST_LIBRARIES} ${GTKMM_LIBRARIES})
   add_test(NAME annotation_panel COMMAND annotation_panel_test)
   set_tests_properties(annotation_panel PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 endif()

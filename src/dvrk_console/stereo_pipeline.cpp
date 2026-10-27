@@ -23,6 +23,28 @@ bool is_valid_sink(const std::string &sink) {
   return is_side_by_side_sink(sink) || is_separate_sink(sink) || is_headless_sink(sink);
 }
 
+std::vector<dvrk_video::LatestVideoPosition> pip_widget_positions(
+    const dvrk_video::LatestVideoSpec &spec, int disparity_px) {
+  std::vector<dvrk_video::LatestVideoPosition> positions;
+  if (spec.name != "__stereo_comp__" || spec.inputs.size() <= 2) return positions;
+  const int eye_w = spec.width / 2;
+  const size_t count = (spec.inputs.size() - 2) / 2;
+  // Use wide arithmetic so even invalid startup configurations cannot overflow.
+  const int64_t offset = -static_cast<int64_t>(disparity_px);
+  const int64_t lo = offset / 2, hi = offset - lo;
+  for (int side = 0; side < 2; ++side) {
+    for (size_t i = 0; i < count; ++i) {
+      const auto &input = spec.inputs[2 + side * count + i];
+      const int64_t base = i * (input.width + dvrk_data::AppConfig::gap_px);
+      const int64_t origin = side * eye_w;
+      const int x = static_cast<int>(std::clamp(origin + base + (side ? hi : -lo),
+          origin, origin + eye_w - input.width));
+      positions.push_back({input.name, x, input.y});
+    }
+  }
+  return positions;
+}
+
 std::string build_pipeline_string(const dvrk_data::AppConfig &stereo, bool include_overlay,
     std::vector<dvrk_video::LatestVideoSpec> *mixer_specs) {
   using dvrk_video::CameraContent;
@@ -150,13 +172,10 @@ std::string build_pipeline_string(const dvrk_data::AppConfig &stereo, bool inclu
         branches += " " + extras.stereos[i].right + queue + " ! videoconvert ! video/x-raw,format=RGBA"
             " ! tee name=__extra_stereo_right" + std::to_string(i) + "__ ";
       }
-      const int disparity = -stereo.widget_horizontal_disparity_px;
-      const int lo = disparity / 2, hi = disparity - lo;
       for (int side = 0; side < 2; ++side) {
         for (int i = 0; i < n_extra; ++i) {
           const int base_x = i * (slot_w + gap);
-          const int x = side ? std::max(eye_w, std::min(stereo_w - slot_w, eye_w + base_x + hi))
-                             : std::max(0, std::min(eye_w - slot_w, base_x - lo));
+          const int x = side * eye_w + base_x;
           const auto name = "pip_extra_" + std::to_string(side) + "_" + std::to_string(i);
           spec.inputs.push_back({name, x, stereo_h + gap, slot_w, mono_h, CameraContent::None, true, 0.0});
           const auto tee = i < n_mono ? "__extra_mono" + std::to_string(i) + "__"
@@ -164,6 +183,8 @@ std::string build_pipeline_string(const dvrk_data::AppConfig &stereo, bool inclu
           inputs.push_back(tee + "." + queue);
         }
       }
+      const auto positions = pip_widget_positions(spec, stereo.widget_horizontal_disparity_px);
+      for (size_t i = 0; i < positions.size(); ++i) spec.inputs[i + 2].x = positions[i].x;
       presentation = mix(spec, inputs);
     }
     outputs += " " + presentation + " ! tee name=__stereo_display_out__ ";

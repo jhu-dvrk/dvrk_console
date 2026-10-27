@@ -1,4 +1,5 @@
 #include "annotation_panel.hpp"
+#include "glib_ros_executor.hpp"
 #include <dvrk_data/dvrk_gst_socket.hpp>
 #include <unistd.h>
 #include <iostream>
@@ -19,6 +20,13 @@ int main(int argc, char **argv) {
   if (!gtk_init_check(&argc, &argv)) return 77;
   Gtk::Main gtk(argc, argv);
   auto node = std::make_shared<rclcpp::Node>("annotation_panel_test");
+  dvrk_console::GlibRosExecutor executor(node);
+  auto disparity_pub = node->create_publisher<std_msgs::msg::Int32>(
+      "/stereo_display/widget_horizontal_disparity_px", rclcpp::QoS(1).reliable().transient_local());
+  auto set_disparity = [&](int value) {
+    std_msgs::msg::Int32 message; message.data = value; disparity_pub->publish(message);
+  };
+  set_disparity(20); // Publish before the panel subscribes: exercise latching.
   dvrk_console::AnnotationConfig config;
   config.gst_input = "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=640,height=240,framerate=30/1";
   config.gst_output = "@dvrk:test:annotations_" + std::to_string(getpid());
@@ -82,15 +90,53 @@ int main(int argc, char **argv) {
     send(GDK_MOTION_NOTIFY, x + 30, y);
     send(GDK_BUTTON_RELEASE, x + 30, y);
     check(alpha(1), "Pointer stroke did not reach the output socket");
+    Gtk::CheckButton *both = nullptr;
+    Gtk::ComboBoxText *eye = nullptr;
+    Gtk::Button *clear = nullptr;
     for (auto *child : panel.get_children()) {
       if (auto *box = dynamic_cast<Gtk::Box*>(child)) {
         for (auto *widget : box->get_children()) {
           if (auto *button = dynamic_cast<Gtk::Button*>(widget))
-            if (button->get_label() == "Clear all") button->clicked();
+            if (button->get_label() == "Clear all") clear = button;
+          if (auto *button = dynamic_cast<Gtk::CheckButton*>(widget))
+            if (button->get_label() == "Both eyes") both = button;
+          if (auto *combo = dynamic_cast<Gtk::ComboBoxText*>(widget))
+            if (combo->get_active_text() == "Left eye") eye = combo;
         }
       }
     }
+    check(both && eye && clear, "Missing annotation controls");
+    clear->clicked();
     check(alpha(0), "Clear all left opaque pixels on the socket");
+    auto tap_positions = [&](int left_x, int right_x, int old_right_x) {
+      for (int i = 0; i < 100; ++i) {
+        pump(20);
+        auto *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 0);
+        if (!sample) continue;
+        GstVideoInfo info;
+        gst_video_info_from_caps(&info, gst_sample_get_caps(sample));
+        GstMapInfo map;
+        check(gst_buffer_map(gst_sample_get_buffer(sample), &map, GST_MAP_READ), "Cannot map tap output");
+        const int stride = GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
+        auto opaque = [&](int px) { return map.data[120 * stride + px * 4 + 3] != 0; };
+        const bool matches = opaque(left_x) && opaque(320 + right_x) && !opaque(320 + old_right_x);
+        gst_buffer_unmap(gst_sample_get_buffer(sample), &map);
+        gst_sample_unref(sample);
+        if (matches) return true;
+      }
+      return false;
+    };
+    both->set_active(true);
+    send(GDK_BUTTON_PRESS, x, y); send(GDK_BUTTON_RELEASE, x, y);
+    check(tap_positions(160, 140, 160), "Late-joined disparity did not position both-eye tap");
+    set_disparity(-20);
+    check(tap_positions(160, 180, 140), "Live disparity did not reposition existing drawing");
+    clear->clicked(); check(alpha(0), "Both-eye clear failed");
+    eye->set_active(1);
+    send(GDK_BUTTON_PRESS, x, y); send(GDK_BUTTON_RELEASE, x, y);
+    check(tap_positions(140, 160, 180), "Right-eye source used the wrong disparity direction");
+    clear->clicked(); check(alpha(0), "Cannot clear right-source drawing");
+    eye->set_active(0); both->set_active(false);
     send(GDK_BUTTON_PRESS, x, y);
     send(GDK_BUTTON_RELEASE, x, y);
     check(alpha(1), "Cannot draw after clearing");

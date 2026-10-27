@@ -1,4 +1,5 @@
 #include "frame_timing.hpp"
+#include "frame_timing_diagnostics.hpp"
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -15,6 +16,15 @@ int main() {
   stats.observe(times, 3, 10 * GST_SECOND, 0);
   stats.observe(times, 3, 10 * GST_SECOND + 200 * GST_MSECOND, 200 * GST_MSECOND);
   auto result = stats.snapshot(GST_SECOND);
+  auto diagnostics = dvrk_console::frame_timing_diagnostics(result, "/display", "test camera");
+  using diagnostic_msgs::msg::DiagnosticStatus;
+  check(diagnostics.status.size() == 3 && diagnostics.status[0].level == DiagnosticStatus::STALE &&
+        diagnostics.status[1].hardware_id == "test camera" &&
+        diagnostics.status[2].values[0].value == "-50.000",
+        "Diagnostics lost stale state, device identity or signed stereo difference");
+  check(diagnostics.status[0].values[0].key == "current_age_ms" &&
+        diagnostics.status[0].values[0].value == "1100.000",
+        "Diagnostics differ from GUI snapshot");
   close_to(result.eyes[0].current, 1100, "Current age must grow without new buffers");
   close_to(result.eyes[0].average, 200, "Incorrect rolling average");
   close_to(result.eyes[0].maximum, 300, "Incorrect rolling maximum");
@@ -36,6 +46,11 @@ int main() {
   stats.observe(times, 1, 17 * GST_SECOND, 7 * GST_SECOND);
   result = stats.snapshot(7 * GST_SECOND);
   check(!result.eyes[0].current && !result.delta.current, "Missing timestamps became zero-age video");
+  diagnostics = dvrk_console::frame_timing_diagnostics(result, "/display", "test camera");
+  check(diagnostics.status[0].level == DiagnosticStatus::WARN &&
+        diagnostics.status[0].values[0].value == "unavailable" &&
+        diagnostics.status[2].level == DiagnosticStatus::WARN,
+        "Diagnostics reported missing timestamps as healthy zero-age frames");
   times.left_source_ts = 18 * GST_SECOND;
   stats.observe(times, 1, 17 * GST_SECOND, 7 * GST_SECOND);
   check(!stats.snapshot(7 * GST_SECOND).eyes[0].current, "Future wall-clock timestamps became negative ages");

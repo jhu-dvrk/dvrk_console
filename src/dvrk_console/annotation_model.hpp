@@ -33,11 +33,15 @@ struct AnnotationStroke {
   unsigned eyes;
   double red, green, blue, width;
   std::vector<AnnotationPoint> points;
+  unsigned source_eye = 1;
+  // Retain stereo placement if Undo/Clear later removes the source eye.
+  bool stereo = false;
 };
 
 struct AnnotationModel {
   std::vector<AnnotationStroke> strokes;
   bool visible = true;
+  int disparity_px = 0;
   void clear(unsigned eyes) {
     for (auto &stroke : strokes) stroke.eyes &= ~eyes;
     strokes.erase(std::remove_if(strokes.begin(), strokes.end(),
@@ -58,18 +62,21 @@ struct AnnotationModel {
     cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
     for (const auto &stroke : strokes) {
       if (!(stroke.eyes & eye) || stroke.points.empty()) continue;
+      const double shift = stroke.stereo && eye != stroke.source_eye
+          ? (stroke.source_eye == 1 ? -static_cast<double>(disparity_px)
+                                    : static_cast<double>(disparity_px)) : 0.0;
       cairo_new_path(cr);
       cairo_set_source_rgba(cr, stroke.red, stroke.green, stroke.blue, 1);
       const double pen = stroke.width * width;
       cairo_set_line_width(cr, pen);
       const auto &first = stroke.points.front();
       if (stroke.points.size() == 1) {
-        cairo_arc(cr, first.x * width, first.y * height, pen / 2, 0, 2 * std::acos(-1));
+        cairo_arc(cr, first.x * width + shift, first.y * height, pen / 2, 0, 2 * std::acos(-1));
         cairo_fill(cr);
       } else {
-        cairo_move_to(cr, first.x * width, first.y * height);
+        cairo_move_to(cr, first.x * width + shift, first.y * height);
         for (const auto &point : stroke.points)
-          cairo_line_to(cr, point.x * width, point.y * height);
+          cairo_line_to(cr, point.x * width + shift, point.y * height);
         cairo_stroke(cr);
       }
     }

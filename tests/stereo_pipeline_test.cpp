@@ -15,6 +15,19 @@ void replace_all(std::string &text, const std::string &before, const std::string
 int main(int argc, char **argv) {
   gst_init(&argc, &argv);
   dc_frame_timestamps_meta_register();
+  {
+    dvrk_video::LatestVideoSpec layout;
+    layout.name = "__stereo_comp__"; layout.width = 320; layout.height = 120;
+    layout.inputs = {{"left", 0, 0, 160, 80}, {"right", 160, 0, 160, 80},
+                     {"extra_left_0", 0, 84, 78, 36}, {"extra_left_1", 82, 84, 78, 36},
+                     {"extra_right_0", 160, 84, 78, 36}, {"extra_right_1", 242, 84, 78, 36}};
+    auto positions = dvrk_console::pip_widget_positions(layout, 5);
+    check(positions[0].x == 2 && positions[1].x == 82 && positions[2].x == 160 && positions[3].x == 239,
+          "Odd positive PiP disparity or edge clamping incorrect");
+    positions = dvrk_console::pip_widget_positions(layout, -5);
+    check(positions[0].x == 0 && positions[1].x == 80 && positions[2].x == 163 && positions[3].x == 242,
+          "Negative PiP disparity or edge clamping incorrect");
+  }
   for (int variant = 0; variant < 6; ++variant) {
     dvrk_data::AppConfig cfg;
     cfg.original_width = 160; cfg.original_height = 120;

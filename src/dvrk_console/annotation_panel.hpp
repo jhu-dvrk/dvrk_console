@@ -5,6 +5,7 @@
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
 #include <mutex>
+#include <std_msgs/msg/int32.hpp>
 #include "annotation_model.hpp"
 #include "gst_pipeline_runtime.hpp"
 
@@ -59,6 +60,7 @@ private:
   gint64 m_last_frame = 0;
   std::mutex m_mutex;
   AnnotationModel m_model;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr m_disparity_sub;
 };
 } // namespace dvrk_console
 #endif

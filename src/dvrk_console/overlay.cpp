@@ -425,7 +425,6 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
   double overlay_alpha = 0.7;
   int display_horizontal_offset_px = 0;
   bool show_eye_labels = false;
-  bool show_grid = false;
   RollIndicator camera_roll;
   GravityIndicator camera_gravity;
   std::unordered_map<std::string, ArmOverlayInfo> arm_info;
@@ -471,7 +470,6 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
     overlay_alpha = overlay_state->overlay_alpha;
     display_horizontal_offset_px = overlay_state->display_horizontal_offset_px;
     show_eye_labels = overlay_state->show_eye_labels;
-    show_grid = overlay_state->show_grid;
     camera_roll = overlay_state->camera_roll;
     camera_gravity = overlay_state->camera_gravity;
     arm_info = overlay_state->arm_info;
@@ -554,52 +552,6 @@ void on_overlay_draw(GstElement *overlay, cairo_t *cr, guint64, guint64,
       draw_eye_label("L", eye_width * 0.25);
     } else if (overlay_view == OverlayView::RightEye) {
       draw_eye_label("R", eye_width * 0.75);
-    }
-  }
-
-  // Draw calibration grid (same pattern as the calibration script)
-  if (show_grid) {
-    static const double k_grid_colors[12][3] = {
-        {1.0, 0.20, 0.20}, {0.20, 1.0, 0.20}, {0.20, 0.20, 1.0}, {1.0, 1.0, 0.20},
-        {1.0, 0.20, 1.0}, {0.20, 1.0, 1.0}, {1.0, 0.60, 0.20}, {0.60, 0.20, 1.0},
-        {0.20, 0.60, 0.20}, {1.0, 0.40, 0.40}, {0.40, 0.80, 1.0}, {1.0, 0.80, 0.40},
-    };
-    constexpr int grid_rows = 3;
-    constexpr int grid_cols = 4;
-    const double sq = frame_height * 0.05;
-    const double span_w = eye_width * 0.8;
-    const double span_h = frame_height * 0.8;
-    const double pad_x = (span_w - grid_cols * sq) / (grid_cols - 1);
-    const double pad_y = (span_h - grid_rows * sq) / (grid_rows - 1);
-    const double grid_w = grid_cols * sq + (grid_cols - 1) * pad_x;
-    const double grid_h = grid_rows * sq + (grid_rows - 1) * pad_y;
-    const double circle_r = frame_height * 0.4;
-    const double cy_mid = frame_height * 0.5;
-    const int n_eyes = is_stereo_layout ? 2 : 1;
-    for (int eye_idx = 0; eye_idx < n_eyes; ++eye_idx) {
-      // The grid is a zero-disparity reference in final display coordinates.
-      const double cx = is_stereo_layout
-                            ? eye_width * (static_cast<double>(eye_idx) + 0.5)
-                            : eye_width * 0.5;
-      // White circle for aspect ratio calibration
-      cairo_new_path(cr);
-      cairo_arc(cr, cx, cy_mid, circle_r, 0.0, 2.0 * M_PI);
-      cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.85);
-      cairo_set_line_width(cr, 4.0);
-      cairo_stroke(cr);
-      // Colored squares grid
-      const double start_x = cx - grid_w * 0.5;
-      const double start_y = cy_mid - grid_h * 0.5;
-      for (int r = 0; r < grid_rows; ++r) {
-        for (int c = 0; c < grid_cols; ++c) {
-          const double x = start_x + c * (sq + pad_x);
-          const double y = start_y + r * (sq + pad_y);
-          const auto &col = k_grid_colors[r * grid_cols + c];
-          cairo_set_source_rgba(cr, col[0], col[1], col[2], 1.0);
-          cairo_rectangle(cr, x, y, sq, sq);
-          cairo_fill(cr);
-        }
-      }
     }
   }
 

@@ -6,6 +6,8 @@
 #include <vector>
 namespace dvrk_console {
 bool is_valid_sink(const std::string &sink);
+std::vector<dvrk_video::LatestVideoPosition> pip_widget_positions(
+    const dvrk_video::LatestVideoSpec &spec, int disparity_px);
 std::string build_pipeline_string(const dvrk_data::AppConfig &config, bool include_overlay,
     std::vector<dvrk_video::LatestVideoSpec> *mixers = nullptr);
 }

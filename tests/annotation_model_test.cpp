@@ -41,6 +41,29 @@ int main() {
         "Undo on one eye changed the other eye");
   model.clear(3);
   check(pixel(1, 50, 50) == 0 && pixel(2, 50, 50) == 0, "Clear left stale drawing pixels");
+  model.strokes.push_back({3, 1, 0, 0, 0.04, {{0.5, 0.5}}, 1, true});
+  model.disparity_px = 20;
+  check(pixel(1, 50, 50) == 0xffff0000 && pixel(2, 30, 50) == 0xffff0000 && pixel(2, 50, 50) == 0,
+        "Left-source stereo tap has incorrect disparity");
+  model.disparity_px = -20;
+  check(pixel(1, 50, 50) == 0xffff0000 && pixel(2, 70, 50) == 0xffff0000 && pixel(2, 30, 50) == 0,
+        "Live disparity did not move existing hidden-eye tap");
+  model.strokes.back().source_eye = 2;
+  model.strokes.back().points.push_back({0.6, 0.5});
+  check(pixel(2, 55, 50) == 0xffff0000 && pixel(1, 35, 50) == 0xffff0000 && pixel(1, 55, 50) == 0,
+        "Right-source path used wrong disparity sign");
+  model.undo(2);
+  check(pixel(2, 55, 50) == 0 && pixel(1, 35, 50) == 0xffff0000,
+        "Undoing source eye changed remaining eye placement");
+  model.disparity_px = 80;
+  check(pixel(1, 99, 50) == 0, "Off-image stroke was clamped to the boundary");
+  model.disparity_px = 0;
+  check(pixel(1, 55, 50) == 0xffff0000, "Zero disparity moved a stroke");
+  model.clear(3);
+  model.strokes.push_back({1, 1, 0, 0, 0.04, {{0.5, 0.5}}, 1, false});
+  model.disparity_px = 20;
+  check(pixel(1, 50, 50) == 0xffff0000 && pixel(2, 30, 50) == 0,
+        "Disparity shifted or duplicated a single-eye stroke");
   cairo_destroy(cr); cairo_surface_destroy(surface);
   std::cout << "Annotation mapping, alpha, eye selection, undo and clear passed\n";
 }

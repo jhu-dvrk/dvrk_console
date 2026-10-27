@@ -4,6 +4,13 @@
 namespace dvrk_console {
 AnnotationPanel::AnnotationPanel(rclcpp::Node *node, const AnnotationConfig &config)
     : Gtk::Box(Gtk::ORIENTATION_VERTICAL, 4), m_node(node), m_config(config) {
+  m_disparity_sub = m_node->create_subscription<std_msgs::msg::Int32>(
+      "/stereo_display/widget_horizontal_disparity_px",
+      rclcpp::QoS(1).reliable().transient_local(),
+      [this](const std_msgs::msg::Int32::SharedPtr value) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_model.disparity_px = value->data;
+      });
   m_eye.append("Left eye"); m_eye.append("Right eye"); m_eye.set_active(0);
   m_color.append("Yellow"); m_color.append("Red"); m_color.append("Green");
   m_color.append("White"); m_color.set_active(0);
@@ -20,7 +27,7 @@ AnnotationPanel::AnnotationPanel(rclcpp::Node *node, const AnnotationConfig &con
     widget->set_size_request(-1, 44);
     m_actions.pack_start(*widget, Gtk::PACK_SHRINK);
   }
-  m_both.set_tooltip_text("Apply new strokes, undo and clear to both eyes at identical image coordinates");
+  m_both.set_tooltip_text("Draw in both eyes at widget depth using the live display disparity; undo and clear affect both eyes");
   pack_start(m_tools, Gtk::PACK_SHRINK);
   pack_start(m_actions, Gtk::PACK_SHRINK);
   m_canvas.set_size_request(160, 120);
@@ -275,7 +282,9 @@ void AnnotationPanel::begin(double x, double y) {
   std::lock_guard<std::mutex> lock(m_mutex);
   m_model.strokes.push_back({target_eyes(), color == 2 ? 0.0 : 1.0,
                             color == 1 ? 0.0 : 1.0, color == 3 ? 1.0 : 0.0,
-                            widths[m_width.get_active_row_number()], {point}});
+                            widths[m_width.get_active_row_number()], {point},
+                            m_eye.get_active_row_number() == 0 ? 1u : 2u,
+                            m_both.get_active()});
   m_drawing = true; m_canvas.queue_draw();
 }
 void AnnotationPanel::extend(double x, double y) {

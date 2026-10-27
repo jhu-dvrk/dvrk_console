@@ -44,6 +44,7 @@
 #include "frame_timing_panel.hpp"
 #include "stereo_pipeline.hpp"
 #include "stereo_display_input.hpp"
+#include "widget_disparity.hpp"
 #include <dvrk_data/stereo_common.hpp>
 
 namespace {
@@ -53,23 +54,22 @@ using dvrk_console::is_valid_sink;
 struct CommandLineOptions {
   std::string config_file;
   std::string gst_hint = dvrk_gst::ROLE_STEREO_ALIGNMENT;
-  bool show_grid = false;
 };
 
 static Glib::RefPtr<Gtk::Application> g_app;
 
 void print_usage(const char *executable) {
   std::cerr << "Usage: " << executable
-            << " [-c <config.json>] [--gst-hint <role-or-socket>] [--grid]" << std::endl;
+            << " [-c <config.json>] [--gst-hint <role-or-socket>]" << std::endl;
   std::cerr << "  -c       Configuration file (defaults to ./stereo_display.json)"
             << std::endl;
   std::cerr << "  --gst-hint <role-or-socket>  Default input role (stereo_alignment) or full socket;"
             << " config gst_input takes precedence" << std::endl;
-  std::cerr << "  --grid   Display calibration grid overlay for display alignment"
-            << std::endl;
   std::cerr << "  ROS parameters: ecm_roll_min_degrees (default -90), "
                "ecm_roll_max_degrees (default 90) set roll warning limits"
             << std::endl;
+  std::cerr << "  widget_horizontal_disparity_px: live signed widget/annotation disparity "
+               "in per-eye pixels (defaults to configuration)" << std::endl;
 }
 
 bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
@@ -106,11 +106,6 @@ bool parse_arguments(int argc, char *argv[], CommandLineOptions &options) {
         std::cerr << "Error: " << e.what() << std::endl;
         return false;
       }
-      continue;
-    }
-
-    if (arg == "--grid") {
-      options.show_grid = true;
       continue;
     }
 
@@ -218,10 +213,11 @@ public:
   ControlWindow(std::shared_ptr<dvrk_console::OverlayState> overlay_state,
                 GstElement *pipeline,
                 const dvrk_data::AppConfig &cfg,
-                RebuildCb rebuild_cb)
+                RebuildCb rebuild_cb, rclcpp::Node &node)
       : m_overlay_state(overlay_state), m_pipeline(pipeline),
         m_cfg(cfg), m_rebuild_cb(std::move(rebuild_cb)),
-        m_display_outputs(cfg, "stereo", [this]() { on_quit_clicked(); }) {
+        m_display_outputs(cfg, "stereo", [this]() { on_quit_clicked(); }),
+        m_frame_timing(node, cfg.name) {
     set_title("dVRK Display Control");
     set_border_width(10);
     m_vbox.set_orientation(Gtk::ORIENTATION_VERTICAL);
@@ -508,18 +504,6 @@ int main(int argc, char *argv[]) {
   RCLCPP_INFO(node->get_logger(), "Loaded viewer config: %s", cfg.name.c_str());
   console_name = cfg.dvrk_console_namespace;
   overlay_state->overlay_alpha = cfg.overlay_alpha;
-  overlay_state->show_grid = options.show_grid;
-  {
-    // Scale offset from crop-pixel space to original-pixel space.
-    const double offset_scale =
-        (cfg.preserve_size && cfg.crop_width > 0 && cfg.original_width > 0)
-            ? static_cast<double>(cfg.original_width) /
-                  static_cast<double>(cfg.crop_width)
-            : 1.0;
-    overlay_state->display_horizontal_offset_px = cfg.legacy_display_horizontal_offset
-        ? static_cast<int>(std::round(cfg.display_horizontal_offset_px * offset_scale))
-        : -cfg.widget_horizontal_disparity_px;
-  }
   if (cfg.original_width <= 0 || cfg.original_height <= 0) {
     RCLCPP_ERROR(node->get_logger(),
                  "Config '%s' must provide positive "
@@ -571,6 +555,22 @@ int main(int argc, char *argv[]) {
   }
 
   std::vector<dvrk_video::LatestVideoSpec> mixer_specs;
+  dvrk_video::LatestVideoMixers latest;
+  std::unique_ptr<dvrk_console::WidgetDisparity> widget_disparity;
+  try {
+    widget_disparity = std::make_unique<dvrk_console::WidgetDisparity>(
+        *node, cfg, overlay_state, [&](int disparity) {
+          for (const auto &spec : mixer_specs) {
+            const auto positions = dvrk_console::pip_widget_positions(spec, disparity);
+            if (!positions.empty() && !latest.update_positions(spec.name, positions))
+              RCLCPP_ERROR(node->get_logger(), "Cannot update PiP widget positions");
+          }
+        });
+  } catch (const std::exception &exception) {
+    RCLCPP_ERROR(node->get_logger(), "Invalid widget disparity: %s", exception.what());
+    rclcpp::shutdown();
+    return 1;
+  }
   pipeline_string = build_pipeline_string(app_cfg, overlay_available, &mixer_specs);
 
   const std::string camera_topic = "/" + console_name + "/camera";
@@ -912,7 +912,6 @@ int main(int argc, char *argv[]) {
   };
   start_ar_inputs();
 
-  dvrk_video::LatestVideoMixers latest;
   std::string latest_error;
   if (!latest.start(pipeline, mixer_specs, latest_error)) {
     RCLCPP_ERROR(node->get_logger(), "%s", latest_error.c_str());
@@ -1034,7 +1033,7 @@ int main(int argc, char *argv[]) {
   };
 
   ControlWindow window(overlay_state, pipeline, cfg,
-                       [&rebuild_pipeline](double s) { rebuild_pipeline(s); });
+                       [&rebuild_pipeline](double s) { rebuild_pipeline(s); }, *node);
   control_window_ptr = &window;
 
   // Abstract sockets are kernel-managed — no stale file cleanup needed.

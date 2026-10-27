@@ -2,6 +2,8 @@
 #define DVRK_CONSOLE_FRAME_TIMING_PANEL_HPP
 
 #include "frame_timing.hpp"
+#include "frame_timing_diagnostics.hpp"
+#include <rclcpp/rclcpp.hpp>
 #include <gtkmm.h>
 #include <iomanip>
 #include <memory>
@@ -11,7 +13,10 @@
 namespace dvrk_console {
 class FrameTimingPanel : public Gtk::Frame {
 public:
-  FrameTimingPanel() : Gtk::Frame("Frame timing"), m_stats(std::make_shared<FrameTiming>()) {
+  FrameTimingPanel(rclcpp::Node &node, const std::string &hardware_id)
+      : Gtk::Frame("Frame timing"), m_stats(std::make_shared<FrameTiming>()),
+        m_node(node), m_hardware_id(hardware_id) {
+    m_publisher = node.create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 1);
     m_box.set_border_width(8);
     m_box.set_spacing(5);
     add(m_box);
@@ -25,7 +30,9 @@ public:
     m_reset.set_label("Reset statistics");
     m_reset.signal_clicked().connect([this] { m_stats->reset(); refresh(); });
     m_box.pack_start(m_reset, Gtk::PACK_SHRINK);
-    m_timer = Glib::signal_timeout().connect([this] { refresh(); return true; }, 250);
+    constexpr unsigned gui_interval_ms = 250;
+    m_timer = Glib::signal_timeout().connect([this] { refresh(); return true; },
+                                            std::max(gui_interval_ms, 1000u));
     refresh();
   }
   ~FrameTimingPanel() override { m_timer.disconnect(); detach(); }
@@ -73,6 +80,9 @@ private:
   }
   void refresh() {
     const auto timing = m_stats->snapshot();
+    auto diagnostics = frame_timing_diagnostics(timing, m_node.get_fully_qualified_name(), m_hardware_id);
+    diagnostics.header.stamp = m_node.now();
+    m_publisher->publish(diagnostics);
     std::ostringstream text;
     text << "         Current      Avg      Max     Peak    FPS\n";
     for (unsigned side = 0; side < 2; ++side) {
@@ -89,6 +99,9 @@ private:
     m_values.set_text(text.str());
   }
   std::shared_ptr<FrameTiming> m_stats;
+  rclcpp::Node &m_node;
+  std::string m_hardware_id;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr m_publisher;
   Gtk::Box m_box{Gtk::ORIENTATION_VERTICAL};
   Gtk::Label m_values, m_note;
   Gtk::Button m_reset;
