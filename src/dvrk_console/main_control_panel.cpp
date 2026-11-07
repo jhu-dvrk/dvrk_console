@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cctype>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 #include <memory>
 #include <optional>
@@ -37,12 +38,14 @@
 
 #include <fstream>
 #include <dvrk_data/config.hpp>
+#include <dvrk_data/cpu_timestamp_meta.hpp>
 #include <dvrk_data/dvrk_gst_socket.hpp>
 #include <dvrk_data/stereo_common.hpp>
 #include <dvrk_data/window_monitor_manager.hpp>
 #include "glib_ros_executor.hpp"
 #include "gst_pipeline_runtime.hpp"
 #include "annotation_panel.hpp"
+#include "video_sources.hpp"
 
 // Configuration and State structures
 struct ArmStatus {
@@ -58,12 +61,6 @@ struct ResetState {
     std::string arm_name;
     enum Stage { IDLE, WAITING_FOR_DISABLE, WAITING_FOR_ENABLE, WAITING_FOR_HOME, FINISHED } stage = IDLE;
     std::chrono::steady_clock::time_point last_command_time;
-};
-
-struct VideoSource {
-    std::string label;
-    std::string socket_path;
-    int eye = -1;  // 0 = left half, 1 = right half; -1 = explicit mono source
 };
 
 struct ControlPanelConfig {
@@ -199,65 +196,10 @@ private:
 
 // ── Video source resolution and discovery ─────────────────────────────────────
 
-/// Build a label from an abstract socket name for display in the UI.
-/// "@dvrk:role:name" → "name (role)"
-std::string video_source_label(const std::string &abstract_name) {
-    const auto last_colon = abstract_name.rfind(':');
-    if (last_colon == std::string::npos) return abstract_name;
-    const std::string name = abstract_name.substr(last_colon + 1);
-    const auto mid_colon = abstract_name.rfind(':', last_colon - 1);
-    if (mid_colon == std::string::npos) return name;
-    const std::string role =
-        abstract_name.substr(mid_colon + 1, last_colon - mid_colon - 1);
-    return name + " (" + role + ")";
-}
-
 /// Resolve a user-supplied source string to a fully-qualified abstract name.
 /// Accepts the canonical "@dvrk:role:name" form.
 std::string resolve_video_source_path(const std::string &source) {
     return dvrk_gst::resolve(source, dvrk_gst::ROLE_STEREO_DISPLAY);
-}
-
-/// Expose only the two eye views of supported side-by-side stereo sockets.
-std::vector<VideoSource> stereo_eye_sources(const std::string &name) {
-    std::string role;
-    if (name == "@dvrk:stereo_source:stereo") role = "stereo_source";
-    else if (name == "@dvrk:stereo_alignment:stereo") role = "stereo_alignment";
-    else if (name == "@dvrk:stereo_rectify:stereo") role = "stereo_rectify";
-    else if (name == "@dvrk:stereo_display:overlay") role = "overlay";
-    else return {};
-    return {{"stereo::left (" + role + ")", name, 0},
-            {"stereo::right (" + role + ")", name, 1}};
-}
-
-std::string video_source_key(const VideoSource &source) {
-    return source.socket_path + "#" + std::to_string(source.eye);
-}
-
-std::vector<VideoSource> scan_available_video_sources() {
-    std::vector<VideoSource> found;
-    for (const auto &name : dvrk_gst::list_sockets()) {
-        auto eyes = stereo_eye_sources(name);
-        found.insert(found.end(), eyes.begin(), eyes.end());
-    }
-    return found;
-}
-
-// Read negotiated input caps before videocrop forwards them downstream.
-GstPadProbeReturn configure_stereo_eye_crop(GstPad *, GstPadProbeInfo *info, gpointer data) {
-    auto *crop = GST_ELEMENT(data);
-    auto *event = GST_PAD_PROBE_INFO_EVENT(info);
-    if (GST_EVENT_TYPE(event) != GST_EVENT_CAPS) return GST_PAD_PROBE_OK;
-    GstCaps *caps = nullptr;
-    gst_event_parse_caps(event, &caps);
-    GstStructure *structure = gst_caps_get_structure(caps, 0);
-    int width = 0;
-    if (!gst_structure_get_int(structure, "width", &width) || width < 2 || width % 2)
-        return GST_PAD_PROBE_DROP;
-    const int eye = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(crop), "eye"));
-    g_object_set(crop, "left", eye == 1 ? width / 2 : 0,
-                "right", eye == 0 ? width / 2 : 0, nullptr);
-    return GST_PAD_PROBE_OK;
 }
 
 void print_usage(const char *executable) {
@@ -943,9 +885,8 @@ private:
         }
     }
 
-    void on_input_clicked() {
+    void rebuild_input_menu() {
         for (auto* child : m_input_menu.get_children()) m_input_menu.remove(*child);
-        refresh_video_sources();
         if (m_video_sources.empty()) {
             auto* item = create_menu_item("No video inputs available");
             item->set_sensitive(false);
@@ -954,6 +895,11 @@ private:
             append_video_source_items(m_input_menu);
         }
         m_input_menu.show_all();
+    }
+
+    void on_input_clicked() {
+        refresh_video_sources();
+        rebuild_input_menu();
         m_input_menu.popup_at_widget(&m_input_btn, Gdk::GRAVITY_SOUTH_WEST,
                                      Gdk::GRAVITY_NORTH_WEST, nullptr);
     }
@@ -1490,21 +1436,46 @@ private:
         }
     }
 
-    void refresh_video_sources() {
-        std::vector<VideoSource> new_sources = m_explicit_video_sources;
-        std::unordered_set<std::string> seen_paths;
-        for (const auto& src : new_sources) {
-            seen_paths.insert(video_source_key(src));
+    void refresh_video_sources(bool probe = true) {
+        if (m_layout_probe.valid() && m_layout_probe.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            m_video_layouts = m_layout_probe.get();
+        auto sockets = dvrk_gst::list_sockets();
+        if (probe && !m_layout_probe.valid()) {
+            auto inputs = sockets;
+            for (const auto &source : m_explicit_video_sources)
+                if (std::find(inputs.begin(), inputs.end(), source.socket_path) == inputs.end())
+                    inputs.push_back(source.socket_path);
+            m_layout_probe = std::async(std::launch::async, [inputs] {
+                return dvrk_video::probe_socket_layouts(inputs);
+            });
         }
-
-        std::vector<VideoSource> discovered = scan_available_video_sources();
-        for (const auto& ds : discovered) {
-            if (seen_paths.find(video_source_key(ds)) == seen_paths.end()) {
-                new_sources.push_back(ds);
-                seen_paths.insert(video_source_key(ds));
+        std::vector<VideoSource> new_sources;
+        std::unordered_set<std::string> seen_paths;
+        const auto add = [&](const VideoSource &source) {
+            if (seen_paths.insert(video_source_key(source)).second) new_sources.push_back(source);
+        };
+        const auto layout = [&](const std::string &name) {
+            const auto found = m_video_layouts.find(name);
+            return found == m_video_layouts.end() ? dvrk_video::Layout::Unknown : found->second;
+        };
+        for (const auto &source : m_explicit_video_sources) {
+            const auto views = stereo_eye_sources(source.socket_path, layout(source.socket_path));
+            if (views.empty()) add(source);
+            else for (const auto &view : views) add(view);
+        }
+        for (const auto &socket : sockets)
+            for (const auto &view : stereo_eye_sources(socket, layout(socket))) add(view);
+        m_video_sources = new_sources;
+        if (!m_current_video_path.empty() && seen_paths.count(m_current_video_path) == 0) {
+            // An explicit source may have opened before its layout was known.
+            // Once classified, retain that socket and select its left eye.
+            for (const auto &source : m_video_sources) {
+                if (m_current_video_path == source.socket_path + "#-1") {
+                    open_video_source(source);
+                    break;
+                }
             }
         }
-        m_video_sources = new_sources;
     }
 
     void on_wrench_clicked() {
@@ -1696,8 +1667,8 @@ private:
             }
         }
 
+        refresh_video_sources();
         if (m_current_video_path.empty()) {
-            refresh_video_sources();
             if (!m_video_sources.empty()) {
                 auto selected = std::find_if(
                     m_video_sources.begin(), m_video_sources.end(),
@@ -2084,6 +2055,10 @@ private:
     }
 
     bool on_ui_tick() {
+        if (m_layout_probe.valid() && m_layout_probe.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            refresh_video_sources(false);
+            if (m_input_menu.get_visible()) rebuild_input_menu();
+        }
         if (!m_reset_timer_active) {
             return true;
         }
@@ -2163,6 +2138,8 @@ private:
     std::string m_console_name;
     std::vector<VideoSource> m_video_sources;
     std::vector<VideoSource> m_explicit_video_sources;
+    std::map<std::string, dvrk_video::Layout> m_video_layouts;
+    std::future<std::map<std::string, dvrk_video::Layout>> m_layout_probe;
 
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr m_teleop_selected_sub;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr m_teleop_unselected_sub;
@@ -2336,6 +2313,7 @@ int main(int argc, char* argv[]) {
 
     // Initialize GStreamer
     gst_init(&argc, &argv);
+    dc_frame_timestamps_meta_register();
 
     // Initialize ROS2
     rclcpp::init(argc, argv);

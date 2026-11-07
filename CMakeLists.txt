@@ -161,6 +161,10 @@ install(DIRECTORY launch/
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(video_sources_test tests/video_sources_test.cpp)
+  target_include_directories(video_sources_test PRIVATE src/dvrk_console ${GST_INCLUDE_DIRS})
+  target_link_libraries(video_sources_test dvrk_data::dvrk_data ${GST_LIBRARIES})
+  add_test(NAME video_sources COMMAND video_sources_test)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   add_test(
     NAME stereo_display_calibration
