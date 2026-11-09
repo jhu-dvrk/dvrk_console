@@ -57,9 +57,18 @@ private:
     if (!pad) return false;
     auto *observer = new Observer{m_stats, mask};
     const auto id = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-      [](GstPad *, GstPadProbeInfo *info, gpointer data) {
+      [](GstPad *probe_pad, GstPadProbeInfo *info, gpointer data) {
         auto &observer = *static_cast<Observer *>(data);
-        observer.stats->observe(dc_buffer_get_frame_timestamps(GST_PAD_PROBE_INFO_BUFFER(info)), observer.mask);
+        auto *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+        GstClockTime running_now = GST_CLOCK_TIME_NONE;
+        if (auto *parent = gst_pad_get_parent_element(probe_pad)) {
+          running_now = gst_element_get_current_running_time(parent);
+          gst_object_unref(parent);
+        }
+        observer.stats->observe(
+            dc_buffer_get_frame_timestamps(buffer), observer.mask,
+            dc_clock_realtime_ns(), timing_monotonic_ns(),
+            buffer ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE, running_now);
         return GST_PAD_PROBE_OK;
       }, observer, [](gpointer data) { delete static_cast<Observer *>(data); });
     m_bindings.push_back({pad, id});

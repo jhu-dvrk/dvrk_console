@@ -54,5 +54,18 @@ int main() {
   times.left_source_ts = 18 * GST_SECOND;
   stats.observe(times, 1, 17 * GST_SECOND, 7 * GST_SECOND);
   check(!stats.snapshot(7 * GST_SECOND).eyes[0].current, "Future wall-clock timestamps became negative ages");
-  std::cout << "Frame age, rolling statistics, distinct FPS, stalls, reset, missing times and signed channel delta passed\n";
+
+  // Fallback to default GStreamer buffer PTS when custom metadata is not present
+  times.left_source_ts = 0;
+  times.right_source_ts = 0;
+  stats.reset(10 * GST_SECOND);
+  stats.observe(times, 3, 0, 10 * GST_SECOND, 5 * GST_SECOND, 5 * GST_SECOND + 30 * GST_MSECOND);
+  stats.observe(times, 3, 0, 10 * GST_SECOND + 100 * GST_MSECOND, 5 * GST_SECOND + 100 * GST_MSECOND, 5 * GST_SECOND + 140 * GST_MSECOND);
+  result = stats.snapshot(10 * GST_SECOND + 200 * GST_MSECOND);
+  close_to(result.eyes[0].current, 140, "Fallback PTS current age is incorrect");
+  close_to(result.eyes[0].average, 35, "Fallback PTS average age is incorrect");
+  check(!result.delta.current, "Delta must be unavailable for default PTS metadata");
+  check(!result.eyes[0].stale, "Fresh fallback PTS frames marked stale");
+
+  std::cout << "Frame age, rolling statistics, distinct FPS, stalls, reset, missing times, fallback PTS and signed channel delta passed\n";
 }

@@ -34,31 +34,75 @@ public:
 
   void observe(const DcFrameTimestamps &timestamps, unsigned mask,
                gint64 wall_now = dc_clock_realtime_ns(),
-               gint64 now = timing_monotonic_ns()) {
+               gint64 now = timing_monotonic_ns(),
+               GstClockTime buffer_pts = GST_CLOCK_TIME_NONE,
+               GstClockTime running_now = GST_CLOCK_TIME_NONE) {
     std::lock_guard<std::mutex> lock(m_mutex);
     const std::array<gint64, 2> origins{timestamps.left_source_ts, timestamps.right_source_ts};
-    for (unsigned side = 0; side < 2; ++side) {
-      if (!(mask & (1u << side))) continue;
-      auto &eye = m_eyes[side];
-      const auto origin = origins[side];
-      eye.available = origin > 0 && origin <= wall_now;
-      if (!eye.available) { eye.origin = 0; continue; }
-      if (origin != eye.origin) {
-        eye.updates.push_back(now);
-        eye.changed_at = now;
+    const bool has_custom = (origins[0] > 0 || origins[1] > 0);
+
+    if (has_custom) {
+      for (unsigned side = 0; side < 2; ++side) {
+        if (!(mask & (1u << side))) continue;
+        auto &eye = m_eyes[side];
+        const auto origin = origins[side];
+        eye.available = origin > 0 && origin <= wall_now;
+        if (!eye.available) {
+          eye.has_origin = false;
+          eye.custom_source = false;
+          eye.origin = 0;
+          continue;
+        }
+        if (!eye.has_origin || !eye.custom_source || origin != eye.origin) {
+          eye.updates.push_back(now);
+          eye.changed_at = now;
+        }
+        eye.has_origin = true;
+        eye.custom_source = true;
+        eye.origin = origin;
+        eye.arrived_at = now;
+        eye.age_at_arrival = static_cast<double>(wall_now - origin) / 1e6;
+        eye.samples.push_back({now, eye.age_at_arrival});
+        update_peak(eye.peak, eye.age_at_arrival);
+        prune(eye.samples, now);
+        prune(eye.updates, now);
       }
-      eye.origin = origin;
-      eye.arrived_at = now;
-      eye.age_at_arrival = static_cast<double>(wall_now - origin) / 1e6;
-      eye.samples.push_back({now, eye.age_at_arrival});
-      update_peak(eye.peak, eye.age_at_arrival);
-      prune(eye.samples, now);
-      prune(eye.updates, now);
-    }
-    if (m_eyes[0].available && m_eyes[1].available) {
-      const double delta = static_cast<double>(m_eyes[0].origin - m_eyes[1].origin) / 1e6;
-      m_deltas.push_back({now, std::abs(delta)});
-      prune(m_deltas, now);
+      if (m_eyes[0].available && m_eyes[1].available &&
+          m_eyes[0].custom_source && m_eyes[1].custom_source) {
+        const double delta = static_cast<double>(m_eyes[0].origin - m_eyes[1].origin) / 1e6;
+        m_deltas.push_back({now, std::abs(delta)});
+        prune(m_deltas, now);
+      }
+    } else {
+      const bool pts_valid = (GST_CLOCK_TIME_IS_VALID(buffer_pts) &&
+                              GST_CLOCK_TIME_IS_VALID(running_now) &&
+                              buffer_pts <= running_now);
+      for (unsigned side = 0; side < 2; ++side) {
+        if (!(mask & (1u << side))) continue;
+        auto &eye = m_eyes[side];
+        if (!pts_valid) {
+          eye.available = false;
+          eye.has_origin = false;
+          eye.custom_source = false;
+          eye.origin = 0;
+          continue;
+        }
+        const auto origin = static_cast<gint64>(buffer_pts);
+        if (!eye.has_origin || eye.custom_source || origin != eye.origin) {
+          eye.updates.push_back(now);
+          eye.changed_at = now;
+        }
+        eye.available = true;
+        eye.has_origin = true;
+        eye.custom_source = false;
+        eye.origin = origin;
+        eye.arrived_at = now;
+        eye.age_at_arrival = static_cast<double>(running_now - buffer_pts) / 1e6;
+        eye.samples.push_back({now, eye.age_at_arrival});
+        update_peak(eye.peak, eye.age_at_arrival);
+        prune(eye.samples, now);
+        prune(eye.updates, now);
+      }
     }
   }
 
@@ -82,7 +126,8 @@ public:
     }
     prune(m_deltas, now);
     summarize(m_deltas, result.delta);
-    if (m_eyes[0].available && m_eyes[1].available)
+    if (m_eyes[0].available && m_eyes[1].available &&
+        m_eyes[0].custom_source && m_eyes[1].custom_source)
       result.delta.current = static_cast<double>(m_eyes[0].origin - m_eyes[1].origin) / 1e6;
     return result;
   }
@@ -95,6 +140,9 @@ public:
       eye.samples.clear();
       eye.updates.clear();
       eye.peak.reset();
+      eye.has_origin = false;
+      eye.custom_source = false;
+      eye.origin = 0;
     }
   }
 
@@ -104,6 +152,8 @@ private:
     gint64 origin = 0, arrived_at = 0, changed_at = 0;
     double age_at_arrival = 0;
     bool available = false;
+    bool has_origin = false;
+    bool custom_source = false;
     std::deque<Point> samples;
     std::deque<gint64> updates;
     std::optional<double> peak;
